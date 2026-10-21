@@ -475,7 +475,7 @@ void Step(Doll& d, float dt) {
     if ((d.t > 0.8 && d.calm > 0.5) || d.t > C.settleTime) {
         Settle(d);
         if (C.debug) {
-            Log("ragdoll: %08x settled after %.1f s (ground %.2f)", d.id, d.t, d.ground);
+            Log("ragdoll: %08x settled after %.1f s (ground %.2f, corpse at %.2f %.2f)", d.id, d.t, d.ground, d.anchor.x, d.anchor.y);
             for (auto& b : d.bones) Log("ragdoll:   %-12s %.2f %.2f %.2f", PartName(d.parts[b.part].part), b.wp.x, b.wp.y, b.wp.z);
         }
     }
