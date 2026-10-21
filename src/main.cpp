@@ -25,7 +25,7 @@ static void Init() {
     char path[MAX_PATH];
     snprintf(path, sizeof path, "%s\\NWNRagdoll.log", g_dir);
     Log_Init(path);
-    Log("NWNRagdoll 0.1 (built " __DATE__ " " __TIME__ ")");
+    Log("NWNRagdoll 0.2 (built " __DATE__ " " __TIME__ ")");
     if (!SupportedBuild()) { Log("unsupported nwmain.exe build - disabled"); return; }
     snprintf(path, sizeof path, "%s\\NWNRagdoll.ini", g_dir);
     Ragdoll_LoadConfig(path);

@@ -1,16 +1,26 @@
 # NWNRagdoll
 
-Ragdoll physics for dying creatures in **Neverwinter Nights: Enhanced Edition** (Windows, build
-8193.37). When a creature dies its body falls with real physics instead of playing the canned
-death animation: it crumples, tips over, slides off steps and comes to rest on the ground the way it
-landed, knocked away from whoever dealt the killing blow. Physics by [Box3D](https://github.com/erincatto/box3d) (Erin Catto, MIT).
+Physics for **Neverwinter Nights: Enhanced Edition** (Windows, build 8193.37):
+
+* **Ragdolls.** When a creature dies, its death animation starts and then real physics takes over
+  with the animation's own motion: the body is knocked over away from whoever dealt the killing blow,
+  goes limp over a second and comes to rest on the ground the way it landed. Knees and elbows only
+  bend the right way and limbs do not pass through each other.
+* **Weapons and shields** fall from the hands and land next to the body.
+* **Cloth.** Cloaks, tabards, belt flaps and loincloths swing with the body's motion, on everyone
+  near you, alive or dead.
+* **Explosions** (fireball, meteor swarm, ice storm, gas / electric / mystical explosions, implosion
+  pulls inwards) throw bodies, dropped weapons and debris.
+* **Debris.** Bashed barrels, crates and other placeables break into wood / stone / shard pieces
+  that fly, lie around for a while and sink away (single player). Physics by [Box3D](https://github.com/erincatto/box3d) (Erin Catto, MIT).
 
 It is purely visual on your machine, nothing is sent to a server, and it works next to NWNPad.
 
 * **Single player** (and games you host): when the body has come to rest the corpse is moved under
   it, so selecting and looting it happens where you see it.
 * **On someone else's server** the corpse cannot be moved, so the body is kept within
-  `MultiplayerPinRadius` (0.6 m) of where the server has the corpse.
+  `MultiplayerPinRadius` (0.6 m) of where the server has the corpse; items stay close to their
+  real spot the same way, and debris needs the local server.
 
 The ground is the area's walkmesh around the body (slopes and steps), and walls and furniture
 are solid, so limbs do not end up in them. Humanoids (players, NPCs, goblins, orcs ...) get a ragdoll
@@ -26,20 +36,30 @@ uninstall. Other game builds are detected and the mod stays off.
 
 | key | default | |
 |---|---|---|
-| Enabled | 1 | |
+| **[Ragdoll]** Enabled | 1 | |
 | MoveCorpseSinglePlayer | 1 | move the corpse under the body when the server runs on this PC |
 | MultiplayerPinRadius | 0.6 | otherwise, how far the body may end up from the corpse (m) |
-| DeathPush | 1.2 | speed of the upper body away from the killer at the moment of death (m/s) |
+| DeathPush | 2.0 | how hard the body is knocked over, away from the killer (m/s at head height) |
+| DeathAnimationSeconds | 0.35 | death animation before the physics takes over (0 = at once) |
+| MuscleTone | 1.0 | fading muscle tone (0 = limp at once) |
+| DropWeapons | 1 | weapons and shields fall from the hands |
 | MaxSimulationSeconds | 6 | simulation time limit per body |
 | MaxActive | 10 | bodies simulated at the same time |
 | Range | 45 | only deaths this close to you (m) |
+| **[Physics]** Explosions | 1 | blasts throw bodies, weapons and debris |
+| Debris | 1 | bashed placeables break into pieces (single player) |
+| DebrisSeconds | 20 | how long pieces stay |
+| Cloth | 1 | cloaks, tabards, flaps swing |
+| ClothStiffness | 1.0 | lower = looser cloth |
 
 ## How it works
 
 `version.dll`-style proxy (`dbghelp.dll`, forwards every export to the system DLL). Hooks the
 exported `Scene::Animate` (once per frame: watch deaths, step the simulations at 60 Hz) and
 `Gob::Animate` (right after the engine animates a creature model: freeze the pose from the moment of
-death and set the bone rotations from the rigid bodies). Death is read from the in-process server in
+death and set the bone rotations from the rigid bodies; cloth chains are simulated there too),
+`CAurBehaviorAttach::Control` (weapons that left the hand stay where they lie) and
+`CNWCVisualEffect::LoadEffect` (fire-and-forget effects with a blast). Death is read from the in-process server in
 single player (`CNWSObject::GetDead`) and from the client's damage level otherwise. The killer is the
 server's last damager (CNWSObject+0x198) in single player; online the closest creature of the other side. See
 `docs/RE_NOTES.md`.

@@ -1,13 +1,18 @@
 // NWNRagdoll - ragdoll physics for dying creatures (client-side visuals, Box3D)
 //
 // The engine animates a creature's model as a tree of Parts (local position / rotation, w-first
-// quaternions). Gob::Animate writes the animated local transforms each frame; right after it we put
-// back the pose frozen at the moment of death and replace the rotations of the main bones with the
-// rigid bodies of a Box3D ragdoll. When the ragdoll has settled the final pose is kept for good.
+// quaternions). When a creature dies its death animation plays for a moment; then the pose of that
+// instant is frozen and the main bones are handed to a Box3D ragdoll that starts with the animation's
+// own motion. Gob::Animate writes the animated local transforms each frame; right after it we put
+// back the frozen pose and replace the rotations of the bones with the rigid bodies. When the body
+// has settled the final pose is kept for good. Weapons and shields leave the hands and fall on their own.
 // In single player (the server runs in this process) the corpse object is moved under the body so
 // looting and selection match what is on screen; against a remote server the body is held close
-// to the corpse position instead.
+// to the corpse position instead. Explosions wake settled bodies up again.
 #include "ragdoll.h"
+#include "phys.h"
+#include "props.h"
+#include "cloth.h"
 #include "game.h"
 #include "qmath.h"
 #include "log.h"
@@ -21,6 +26,7 @@
 #include <string>
 
 using namespace G;
+using P::BV; using P::VB; using P::BQ; using P::QB;
 
 namespace {
 // ---- settings ----
@@ -28,68 +34,26 @@ struct Cfg {
     int enabled = 1;
     int reposition = 1;          // single player: move the corpse object under the body
     float pinRadius = 0.6f;      // remote server: how far the body may end up from the corpse position
-    float push = 1.2f;           // backwards velocity of the upper body at death (m/s)
+    float push = 2.0f;           // velocity added away from the killer at death (m/s, at head height)
+    float animLead = 0.35f;       // seconds of the death animation before the physics takes over
+    float muscle = 1.0f;         // strength of the fading muscle tone (0 = limp at once)
     float settleTime = 6.0f;     // seconds of simulation at most
     int maxActive = 10;          // ragdolls simulated at the same time
     float range = 45.0f;         // only creatures this close to the player
+    int dropWeapons = 1;         // weapons and shields fall from the hands
+    int explosions = 1;          // blasts push bodies
     int debug = 0;
-    char devFile[260] = "";      // testing: "kill <client id hex>" commands
+    char devFile[260] = "";      // testing commands
 } C;
 
-// ---- engine ----
 typedef void (*Animate_t)(void* gob, float dt);
 Animate_t o_GobAnimate = nullptr, o_SceneAnimate = nullptr;
-typedef void (*GetWorld_t)(void* part, V3* pos, Q4* q);
-GetWorld_t fGetWorld = nullptr;
-typedef void* (*GetCreature_t)(void* srv, uint32_t id);
-GetCreature_t fSrvCreature = nullptr;
-typedef void (*SetPos_t)(void* obj, const V3* pos, int);
-SetPos_t fSrvSetPosition = nullptr;
+typedef int (*AttachControl_t)(void* beh, float dt);
+AttachControl_t o_AttachControl = nullptr;
 typedef int (*GetDead_t)(void* obj);
 GetDead_t fSrvGetDead = nullptr;
-void** p_AppManager = nullptr;
 
-// ---- ground: the area's tile walkmeshes ----
-typedef void* (*GetTile_t)(void* area, const V3* pos);
-GetTile_t fGetTile = nullptr;               // CNWCArea::GetTile(Vector) 0x1407d9d00
-typedef void (*Rot_t)(void* tile, float x, float y, float* ox, float* oy);
-Rot_t fToCanonical = nullptr;
-typedef int (*FindTri_t)(void* mesh, int type, int start, float x, float y, int skip);
-FindTri_t fFindTri = nullptr;
-typedef float (*Height_t)(void* mesh, const V3* p);
-Height_t fMeshHeight = nullptr;
-// height of the walkmesh at (x, y); false where nothing is walkable
-bool GroundAt(void* area, float x, float y, float& h) {
-    if (!area || !fGetTile || !fToCanonical || !fFindTri || !fMeshHeight) return false;
-    V3 p{x, y, 0};
-    void* tile = fGetTile(area, &p);
-    if (!tile) return false;
-    void* td = F<void*>(tile, 0x40);
-    void* mesh = td ? F<void*>(td, 8) : nullptr;
-    if (!mesh) return false;
-    float cx, cy;
-    fToCanonical(tile, x, y, &cx, &cy);
-    if (fFindTri(mesh, 0, 0, cx, cy, -1) < 0) return false;
-    V3 c{cx, cy, 0};
-    h = fMeshHeight(mesh, &c) + F<float>(tile, 0x10);
-    return true;
-}
-
-void* ServerApp() { return p_AppManager && *p_AppManager ? F<void*>(*p_AppManager, 8) : nullptr; }
-void* ServerCreature(uint32_t clientId) {
-    void* s = ServerApp();
-    if (!s || !fSrvCreature || !F<void*>(s, 8)) return nullptr;
-    return fSrvCreature(s, clientId & 0x7fffffffu);
-}
-
-const char* PartName(void* p) { void* n = F<void*>(p, 8); return n ? (const char*)n + 0x38 : ""; }
-void* CreatureGob(void* cre) {
-    void* ab = cre ? F<void*>(cre, 0x78) : nullptr;
-    if (!ab || !Readable(ab, 0xd0)) return nullptr;
-    void* g = F<void*>(ab, 0xc8);
-    return g && strcmp(ClassName(g), "Gob") == 0 ? g : nullptr;
-}
-float GobScale(void* gob) { return VCall<float (*)(void*)>(gob, 0x2d0)(gob); }
+void* CreatureGob(void* cre) { return P::ObjectGob(cre); }
 
 bool ClientDead(void* cre) {
     void* st = F<void*>(cre, OFS::Cre_Stats);
@@ -102,31 +66,58 @@ bool ClientDead(void* cre) {
 
 // ---- model snapshot ----
 struct PartRec { void* part; int parent; V3 lp; Q4 lq; float s; int bone = -1; };
+enum JointKind { J_NONE, J_BALL, J_HINGE };
+enum : uint64_t { CAT_GROUND = 1, CAT_CORE = 2, CAT_ARM = 4, CAT_LEG = 8, CAT_DROP = 16 };
 struct Bone {
     int part;                    // index into parts
     int parent = -1;             // parent bone
-    b3BodyId body = b3_nullBodyId;
-    V3 wp; Q4 wq;                // world transform (live while simulating, final afterwards)
     bool root = false;
+    // shape (body local)
+    bool capsule = true; V3 a, b; float radius = 0.05f;
+    uint64_t cat = CAT_CORE;
+    // joint to the parent (frames in body-local space, fixed at the death pose)
+    JointKind joint = J_NONE;
+    b3Transform frameA, frameB;
+    float cone = 0, twist = 0, lower = 0, upper = 0;
+    // simulation
+    b3BodyId body = b3_nullBodyId;
+    b3JointId jid = b3_nullJointId;
+    V3 wp; Q4 wq;                // world transform (live while simulating, final afterwards)
+    V3 v, w;                     // velocities to start with
+};
+struct Drop {                    // a weapon / shield that left the hand
+    void* gob;                   // the attached Gob
+    V3 center, half;             // box in the gob's frame
+    b3BodyId body = b3_nullBodyId;
+    V3 wp; Q4 wq; V3 v, w;
 };
 struct Doll {
     uint32_t id = 0;
     void* gob = nullptr;
     std::vector<PartRec> parts;
     std::vector<Bone> bones;
+    std::vector<Drop> drops;
     b3WorldId world = b3_nullWorldId;
     double t = 0, calm = 0;
     bool done = false;
-    V3 anchor;                   // corpse position at death
+    float muscle = 0;            // spring stiffness at the start of this simulation
+    V3 anchor;                   // corpse position (server) / where the body is held (remote)
     float ground = 0;
-    b3MeshData* mesh = nullptr;  // ground around the body
-    bool moved = false;          // server corpse repositioned
+    b3MeshData* mesh = nullptr;
+    bool moved = false;
+    uint32_t lastBlast = 0;
 };
 std::map<uint32_t, Doll*> g_dolls;          // by creature id
 std::map<void*, Doll*> g_byGob;
+std::map<void*, Drop*> g_dropByGob;
 std::map<uint32_t, bool> g_dead;            // last known dead state
-LARGE_INTEGER g_freq, g_last;
+double g_lastUpdate = 0;
 double g_acc = 0;
+
+// death animation playing before the ragdoll: the last animated pose gives the starting velocities
+struct WT { V3 p; Q4 q; float s; };
+struct Pending { uint32_t id; void* gob; double t0; double lastT = 0; double moveT = 0; std::vector<WT> prev, first; };
+std::map<void*, Pending> g_pending;         // by gob
 
 void Collect(Doll& d, void* p, int parent, int depth) {
     if (!p || depth > 48 || d.parts.size() > 400 || !Readable(p, 0x58)) return;
@@ -137,78 +128,100 @@ void Collect(Doll& d, void* p, int parent, int depth) {
     for (int i = 0; ch && i < n && i < 128; i++) Collect(d, ch[i], me, depth + 1);
 }
 int FindPart(const Doll& d, const char* name) {
-    for (size_t i = 0; i < d.parts.size(); i++) if (_stricmp(PartName(d.parts[i].part), name) == 0) return (int)i;
+    for (size_t i = 0; i < d.parts.size(); i++) if (_stricmp(P::PartName(d.parts[i].part), name) == 0) return (int)i;
     return -1;
 }
 
-// world transforms of all parts from their locals (parts are in parent-before-child order)
-struct WT { V3 p; Q4 q; float s; };
+// world transforms of all parts from their current locals (parts are in parent-before-child order);
+// with bones: the bone parts' locals are first set so they land where their bodies are
 void ComputeWorld(Doll& d, std::vector<WT>& w, bool useBones) {
     w.resize(d.parts.size());
     V3 rp; Q4 rq;
-    fGetWorld(d.parts[0].part, &rp, &rq);
-    float gs = GobScale(d.gob);
+    P::GetWorld(d.parts[0].part, rp, rq);
+    float gs = P::GobScale(d.gob);
     for (size_t i = 0; i < d.parts.size(); i++) {
         PartRec& r = d.parts[i];
         if (r.parent < 0) { w[i] = {rp, rq, gs * r.s}; continue; }
         const WT& pw = w[r.parent];
         if (useBones && r.bone >= 0) {
             const Bone& b = d.bones[r.bone];
-            // local rotation (and the root bone's position) that put the part where its body is
             Q4 lq = Norm(Conj(pw.q) * b.wq);
             F<Q4>(r.part, 0x1c) = lq;
             if (b.root) {
                 V3 lp = Rot(Conj(pw.q), b.wp - pw.p) * (1.0f / (pw.s > 1e-4f ? pw.s : 1.0f));
                 F<V3>(r.part, 0x10) = lp;
             }
-            w[i] = {b.root ? b.wp : pw.p + Rot(pw.q, r.lp * pw.s), b.wq, pw.s * r.s};
+            w[i] = {b.root ? b.wp : pw.p + Rot(pw.q, F<V3>(r.part, 0x10) * pw.s), b.wq, pw.s * r.s};
             continue;
         }
         w[i] = {pw.p + Rot(pw.q, F<V3>(r.part, 0x10) * pw.s), pw.q * F<Q4>(r.part, 0x1c), pw.s * r.s};
     }
 }
+// the same from a raw part tree, in Collect order (pending deaths: no Doll yet)
+void TreeWorld(void* root, std::vector<WT>& w, float gs) {
+    w.clear();
+    struct S { void* p; int par; int depth; };
+    std::vector<S> st{{root, -1, 0}};
+    while (!st.empty()) {
+        S s = st.back(); st.pop_back();
+        if (!s.p || s.depth > 48 || w.size() > 400 || !Readable(s.p, 0x58)) continue;
+        int me = (int)w.size();
+        WT t;
+        if (s.par < 0) { V3 rp; Q4 rq; P::GetWorld(s.p, rp, rq); t = {rp, rq, gs * F<float>(s.p, 0x2c)}; }
+        else {
+            const WT pw = w[s.par];
+            t = {pw.p + Rot(pw.q, F<V3>(s.p, 0x10) * pw.s), pw.q * F<Q4>(s.p, 0x1c), pw.s * F<float>(s.p, 0x2c)};
+        }
+        w.push_back(t);
+        void** ch = F<void**>(s.p, 0x38); int n = F<int>(s.p, 0x40);
+        for (int i = (n < 128 ? n : 128) - 1; ch && i >= 0; i--) st.push_back({ch[i], me, s.depth + 1});
+    }
+}
 
 // ---- skeleton template (the standard NWN humanoid bone names; other skeletons use a generic chain) ----
-struct Tmpl { const char* name; const char* parent; const char* tip; float radius; float cone; float twist; };
+struct Tmpl { const char* name; const char* parent; const char* tip; float radius; float cone; float twist; JointKind joint; uint64_t cat; };
 const Tmpl HUMANOID[] = {
-    {"rootdummy", nullptr, nullptr, 0.11f, 0, 0},
-    {"torso_g", "rootdummy", "neck_g", 0.13f, 0.45f, 0.35f},
-    {"head_g", "torso_g", "head", 0.10f, 0.7f, 0.7f},
-    {"lbicep_g", "torso_g", "lforearm_g", 0.055f, 1.7f, 0.8f},
-    {"lforearm_g", "lbicep_g", "lhand_g", 0.045f, 1.4f, 0.3f},
-    {"rbicep_g", "torso_g", "rforearm_g", 0.055f, 1.7f, 0.8f},
-    {"rforearm_g", "rbicep_g", "rhand_g", 0.045f, 1.4f, 0.3f},
-    {"lthigh_g", "rootdummy", "lshin_g", 0.07f, 1.2f, 0.4f},
-    {"lshin_g", "lthigh_g", "lfoot_g", 0.055f, 1.4f, 0.2f},
-    {"rthigh_g", "rootdummy", "rshin_g", 0.07f, 1.2f, 0.4f},
-    {"rshin_g", "rthigh_g", "rfoot_g", 0.055f, 1.4f, 0.2f},
+    {"rootdummy", nullptr, nullptr, 0.11f, 0, 0, J_NONE, CAT_CORE},
+    {"torso_g", "rootdummy", "neck_g", 0.13f, 0.45f, 0.35f, J_BALL, CAT_CORE},
+    {"head_g", "torso_g", "head", 0.10f, 0.7f, 0.7f, J_BALL, CAT_CORE},
+    {"lbicep_g", "torso_g", "lforearm_g", 0.055f, 1.5f, 0.8f, J_BALL, CAT_ARM},
+    {"lforearm_g", "lbicep_g", "lhand_g", 0.045f, 0, 0, J_HINGE, CAT_ARM},
+    {"rbicep_g", "torso_g", "rforearm_g", 0.055f, 1.5f, 0.8f, J_BALL, CAT_ARM},
+    {"rforearm_g", "rbicep_g", "rhand_g", 0.045f, 0, 0, J_HINGE, CAT_ARM},
+    {"lthigh_g", "rootdummy", "lshin_g", 0.07f, 1.1f, 0.4f, J_BALL, CAT_LEG},
+    {"lshin_g", "lthigh_g", "lfoot_g", 0.055f, 0, 0, J_HINGE, CAT_LEG},
+    {"rthigh_g", "rootdummy", "rshin_g", 0.07f, 1.1f, 0.4f, J_BALL, CAT_LEG},
+    {"rshin_g", "rthigh_g", "rfoot_g", 0.055f, 0, 0, J_HINGE, CAT_LEG},
 };
-
-b3Vec3 BV(V3 v) { return b3Vec3{v.x, v.y, v.z}; }
-V3 VB(b3Vec3 v) { return V3{v.x, v.y, v.z}; }
-b3Quat BQ(Q4 q) { b3Quat r; r.v = b3Vec3{q.x, q.y, q.z}; r.s = q.w; return r; }
-Q4 QB(b3Quat q) { return Q4{q.s, q.v.x, q.v.y, q.v.z}; }
+uint64_t MaskOf(uint64_t cat) {
+    // hips and shoulders overlap the torso: those pairs never collide; limbs collide with each other
+    switch (cat) {
+    case CAT_CORE: return CAT_GROUND | CAT_ARM;
+    case CAT_ARM: return CAT_GROUND | CAT_CORE | CAT_ARM | CAT_LEG;
+    case CAT_LEG: return CAT_GROUND | CAT_ARM | CAT_LEG;
+    case CAT_DROP: return CAT_GROUND;
+    }
+    return CAT_GROUND;
+}
 
 void DestroyWorld(Doll& d) {
     if (b3World_IsValid(d.world)) b3DestroyWorld(d.world);
     d.world = b3_nullWorldId;
     if (d.mesh) { b3DestroyMesh(d.mesh); d.mesh = nullptr; }
-    for (auto& b : d.bones) b.body = b3_nullBodyId;
+    for (auto& b : d.bones) { b.body = b3_nullBodyId; b.jid = b3_nullJointId; }
+    for (auto& x : d.drops) x.body = b3_nullBodyId;
 }
 
 // where the killing blow came from: the server's "last damager" in single player; online, the closest
 // creature on the other side (your party for enemies, the nearest hostile for everyone else)
 bool KillerPos(void* cre, V3& out) {
     Vec3 cp = Pos(cre);
-    void* sc = ServerCreature(Id(cre));
+    void* sc = P::ServerCreature(Id(cre));
     if (sc) {
-        typedef void* (*as_t)(void*);
-        void* so = VCall<as_t>(sc, 0x20)(sc);                  // AsNWSObject
+        void* so = VCall<void* (*)(void*)>(sc, 0x20)(sc);         // AsNWSObject
         uint32_t dmg = so ? F<uint32_t>(so, 0x198) : 0x7f000000;
-        static auto fGetObj = (void* (*)(void*, uint32_t))GetProcAddress(GetModuleHandleA(nullptr), "?GetGameObject@CServerExoApp@@QEAAPEAVCGameObject@@I@Z");
-        if (dmg != 0x7f000000 && dmg != (Id(cre) & 0x7fffffffu) && fGetObj) {
-            void* g = fGetObj(ServerApp(), dmg);
-            void* o = g ? VCall<as_t>(g, 0x20)(g) : nullptr;
+        if (dmg != 0x7f000000 && dmg != (Id(cre) & 0x7fffffffu)) {
+            void* o = P::ServerObject(dmg);
             if (o) { out = F<V3>(o, 0xa4); if (C.debug) Log("ragdoll: killer %08x", dmg); return true; }
         }
     }
@@ -226,13 +239,157 @@ bool KillerPos(void* cre, V3& out) {
         bool hostile = F<uint8_t>(o, OFS::Cre_Reaction) >= 2;
         if (enemy ? !party : !hostile) continue;
         Vec3 p = Pos(o);
-        float d = (p.x - cp.x) * (p.x - cp.x) + (p.y - cp.y) * (p.y - cp.y);
-        if (d < best && d < 30.0f * 30.0f) { best = d; out = V3{p.x, p.y, p.z}; }
+        float dd = (p.x - cp.x) * (p.x - cp.x) + (p.y - cp.y) * (p.y - cp.y);
+        if (dd < best && dd < 30.0f * 30.0f) { best = dd; out = V3{p.x, p.y, p.z}; }
     }
     return best < 1e9f;
 }
 
-bool StartDoll(void* cre, void* gob) {
+// the body topples nearly in one piece at first, arms looser
+float MuscleScale(const Bone& b) { return b.cat == CAT_ARM ? 0.5f : 1.0f; }
+
+// ---- simulation world: ground, bodies, joints, dropped weapons ----
+void BuildWorld(Doll& d, void* area, bool springs) {
+    b3WorldDef wd = b3DefaultWorldDef();
+    wd.gravity = b3Vec3{0, 0, -9.81f};
+    d.world = b3CreateWorld(&wd);
+    V3 c = d.bones.empty() ? d.anchor : d.bones[0].wp;
+    d.mesh = P::AddGround(d.world, area, V3{c.x, c.y, d.ground}, d.ground, springs ? 29 : 45, 0.25f);
+    for (auto& b : d.bones) {
+        b3BodyDef bd = b3DefaultBodyDef();
+        bd.type = b3_dynamicBody;
+        bd.position = BV(b.wp);
+        bd.rotation = BQ(b.wq);
+        bd.linearVelocity = BV(b.v);
+        bd.angularVelocity = BV(b.w);
+        bd.linearDamping = 0.1f;
+        bd.angularDamping = 1.0f;
+        b.body = b3CreateBody(d.world, &bd);
+        b3ShapeDef sd = b3DefaultShapeDef();
+        sd.filter.categoryBits = b.cat;
+        sd.filter.maskBits = MaskOf(b.cat);
+        sd.baseMaterial.friction = b.cat == CAT_LEG ? 0.5f : 0.8f;
+        sd.baseMaterial.rollingResistance = 0.05f;
+        sd.density = 1000.0f;
+        if (b.capsule) { b3Capsule cap{BV(b.a), BV(b.b), b.radius}; b3CreateCapsuleShape(b.body, &sd, &cap); }
+        else { b3Sphere sp{b3Vec3{0, 0, 0}, b.radius}; b3CreateSphereShape(b.body, &sd, &sp); }
+    }
+    for (auto& b : d.bones) {
+        if (b.parent < 0 || b.joint == J_NONE) continue;
+        Bone& pb = d.bones[b.parent];
+        float hz = springs ? 2.5f * d.muscle * MuscleScale(b) : 0.0f;
+        if (b.joint == J_HINGE) {
+            b3RevoluteJointDef jd = b3DefaultRevoluteJointDef();
+            jd.base.bodyIdA = pb.body; jd.base.bodyIdB = b.body;
+            jd.base.localFrameA = b.frameA; jd.base.localFrameB = b.frameB;
+            jd.base.collideConnected = false;
+            jd.enableLimit = true; jd.lowerAngle = b.lower; jd.upperAngle = b.upper;
+            jd.enableSpring = hz > 0; jd.hertz = hz; jd.dampingRatio = 0.7f; jd.targetAngle = 0;
+            b.jid = b3CreateRevoluteJoint(d.world, &jd);
+        } else {
+            b3SphericalJointDef jd = b3DefaultSphericalJointDef();
+            jd.base.bodyIdA = pb.body; jd.base.bodyIdB = b.body;
+            jd.base.localFrameA = b.frameA; jd.base.localFrameB = b.frameB;
+            jd.base.collideConnected = false;
+            jd.enableConeLimit = true; jd.coneAngle = b.cone;
+            jd.enableTwistLimit = true; jd.lowerTwistAngle = -b.twist; jd.upperTwistAngle = b.twist;
+            jd.enableSpring = hz > 0; jd.hertz = hz; jd.dampingRatio = 0.7f;
+            jd.targetRotation = BQ(Q4{});
+            b.jid = b3CreateSphericalJoint(d.world, &jd);
+        }
+    }
+    for (auto& x : d.drops) {
+        b3BodyDef bd = b3DefaultBodyDef();
+        bd.type = b3_dynamicBody;
+        bd.position = BV(x.wp); bd.rotation = BQ(x.wq);
+        bd.linearVelocity = BV(x.v); bd.angularVelocity = BV(x.w);
+        bd.angularDamping = 0.3f;
+        x.body = b3CreateBody(d.world, &bd);
+        b3ShapeDef sd = b3DefaultShapeDef();
+        sd.filter.categoryBits = CAT_DROP; sd.filter.maskBits = MaskOf(CAT_DROP);
+        sd.baseMaterial.friction = 0.7f;
+        sd.baseMaterial.restitution = 0.15f;
+        sd.density = 600.0f;
+        b3BoxHull box = b3MakeOffsetBoxHull(x.half.x, x.half.y, x.half.z, BV(x.center));
+        b3CreateHullShape(x.body, &sd, &box.base);
+    }
+    d.t = 0; d.calm = 0; d.done = false;
+}
+
+// muscle tone fades over the first second
+void UpdateMuscles(Doll& d) {
+    if (d.muscle <= 0) return;
+    float k = 1.0f - (float)(d.t / 1.6);
+    float base = k > 0 ? 2.5f * d.muscle * k : 0.0f;
+    for (auto& b : d.bones) {
+        if (B3_IS_NULL(b.jid)) continue;
+        float hz = base * MuscleScale(b);
+        if (b.joint == J_HINGE) { if (hz > 0) b3RevoluteJoint_SetSpringHertz(b.jid, hz); else b3RevoluteJoint_EnableSpring(b.jid, false); }
+        else { if (hz > 0) b3SphericalJoint_SetSpringHertz(b.jid, hz); else b3SphericalJoint_EnableSpring(b.jid, false); }
+    }
+    if (base <= 0) d.muscle = 0;
+}
+
+// the weapons in the hands (and a shield on the forearm) leave them
+bool HandAttachment(void* c, const char** name) {
+    if (!c || !Readable(c, 0x458)) return false;
+    void* beh = F<void*>(c, 0x450);
+    void* part = beh && Readable(beh, 0x38) ? F<void*>(beh, 0x30) : nullptr;
+    const char* pn = part && Readable(part, 0x10) ? P::PartName(part) : "";
+    if (name) *name = pn;
+    return !_stricmp(pn, "rhand") || !_stricmp(pn, "lhand") || !_stricmp(pn, "lforearm");
+}
+void CollectDrops(Doll& d, V3 push) {
+    if (!C.dropWeapons) return;
+    void** list = F<void**>(d.gob, 0x4a8); int n = F<int>(d.gob, 0x4b0);
+    for (int i = 0; list && i < n && i < 16; i++) {
+        void* c = list[i];
+        const char* pn = "";
+        if (!HandAttachment(c, &pn)) continue;
+        Drop x; x.gob = c;
+        x.wp = F<V3>(c, 0xa8); x.wq = Norm(F<Q4>(c, 0xb4));
+        V3 mn, mx;
+        if (P::GobExtent(c, mn, mx)) {
+            x.center = (mn + mx) * 0.5f;
+            x.half = (mx - mn) * 0.5f;
+        } else { x.center = V3{0, 0, 0.35f}; x.half = V3{0.04f, 0.04f, 0.4f}; }
+        // thin parts still need some thickness to rest on the ground
+        x.half = V3{fmaxf(x.half.x, 0.02f), fmaxf(x.half.y, 0.02f), fmaxf(x.half.z, 0.02f)};
+        x.v = push * 0.7f + V3{P::Rand(-0.6f, 0.6f), P::Rand(-0.6f, 0.6f), P::Rand(0.8f, 1.6f)};
+        x.w = V3{P::Rand(-4, 4), P::Rand(-4, 4), P::Rand(-4, 4)};
+        if (C.debug) Log("ragdoll: drop '%s' from %s, box %.2f %.2f %.2f at %.2f %.2f %.2f", P::PartName(F<void*>(c, 0x90)), pn,
+                         x.half.x, x.half.y, x.half.z, x.center.x, x.center.y, x.center.z);
+        d.drops.push_back(x);
+    }
+}
+
+// a blast that went off near here a moment ago
+const P::Blast* RecentBlast(V3 at, double within) {
+    if (!C.explosions) return nullptr;
+    double now = P::Now();
+    const P::Blast* best = nullptr;
+    for (auto& b : P::Blasts()) {
+        if (now - b.t > within) continue;
+        V3 d = at - b.p;
+        if (d.x * d.x + d.y * d.y > b.radius * b.radius) continue;
+        best = &b;
+    }
+    return best;
+}
+
+// angular velocity taking q0 to q1 in dt
+V3 AngVel(Q4 q0, Q4 q1, float dt) {
+    Q4 dq = Norm(q1 * Conj(q0));
+    if (dq.w < 0) dq = Q4{-dq.w, -dq.x, -dq.y, -dq.z};
+    float s = sqrtf(dq.x * dq.x + dq.y * dq.y + dq.z * dq.z);
+    if (s < 1e-6f || dt <= 0) return V3{};
+    float ang = 2.0f * atan2f(s, dq.w);
+    return V3{dq.x / s, dq.y / s, dq.z / s} * (ang / dt);
+}
+V3 ClampLen(V3 v, float m) { float l = Len(v); return l > m ? v * (m / l) : v; }
+
+// prevW: world transforms of the part tree one animation frame before (Collect order), or null
+bool StartDoll(void* cre, void* gob, const std::vector<WT>* prevW, float prevDt) {
     Doll* dp = new Doll();
     Doll& d = *dp;
     d.id = Id(cre); d.gob = gob;
@@ -240,43 +397,42 @@ bool StartDoll(void* cre, void* gob) {
     if (d.parts.size() < 3) { delete dp; return false; }
     std::vector<WT> w;
     ComputeWorld(d, w, false);
+    if (prevW && prevW->size() != w.size()) prevW = nullptr;
     Vec3 cp = Pos(cre);
     d.anchor = V3{cp.x, cp.y, cp.z};
     d.ground = cp.z;
+    d.muscle = C.muscle;
 
-    // bones: humanoid template, or every "_g" part with length as a generic chain
-    struct Def { int part; int parentBone; int tip; float radius, cone, twist; };
+    struct Def { int part; int parentBone; int tip; float radius, cone, twist; JointKind joint; uint64_t cat; };
     std::vector<Def> defs;
     bool humanoid = FindPart(d, "rootdummy") >= 0 && FindPart(d, "torso_g") >= 0 && FindPart(d, "lthigh_g") >= 0;
-    float gs = GobScale(gob);
+    float gs = P::GobScale(gob);
     if (humanoid) {
         for (const Tmpl& t : HUMANOID) {
             int p = FindPart(d, t.name);
             if (p < 0) continue;
             int parentBone = -1;
-            if (t.parent) for (size_t k = 0; k < defs.size(); k++) if (_stricmp(PartName(d.parts[defs[k].part].part), t.parent) == 0) parentBone = (int)k;
+            if (t.parent) for (size_t k = 0; k < defs.size(); k++) if (_stricmp(P::PartName(d.parts[defs[k].part].part), t.parent) == 0) parentBone = (int)k;
             if (t.parent && parentBone < 0) continue;
-            defs.push_back({p, parentBone, t.tip ? FindPart(d, t.tip) : -1, t.radius * gs, t.cone, t.twist});
+            defs.push_back({p, parentBone, t.tip ? FindPart(d, t.tip) : -1, t.radius * gs, t.cone, t.twist, t.joint, t.cat});
         }
     } else {
         std::vector<int> boneOf(d.parts.size(), -1);
-        // root: the "rootdummy" of the skeleton, or the first part below the model root that has children
         int rootPart = -1;
         for (size_t i = 1; i < d.parts.size() && rootPart < 0; i++) {
-            std::string n = PartName(d.parts[i].part);
+            std::string n = P::PartName(d.parts[i].part);
             for (auto& ch : n) ch = (char)tolower((unsigned char)ch);
             if (n.find("rootdummy") != std::string::npos) rootPart = (int)i;
         }
         if (rootPart < 0) for (size_t i = 1; i < d.parts.size(); i++) if (d.parts[i].parent == 0 && F<int>(d.parts[i].part, 0x40) > 0) { rootPart = (int)i; break; }
         if (rootPart < 0) { delete dp; return false; }
         boneOf[rootPart] = 0;
-        defs.push_back({rootPart, -1, -1, 0.08f * gs, 0, 0});
+        defs.push_back({rootPart, -1, -1, 0.08f * gs, 0, 0, J_NONE, CAT_CORE});
         for (size_t i = rootPart + 1; i < d.parts.size(); i++) {
-            // only the root's subtree
             int a = d.parts[i].parent; bool inside = false;
             for (; a >= 0; a = d.parts[a].parent) if (a == rootPart) { inside = true; break; }
             if (!inside) continue;
-            std::string n = PartName(d.parts[i].part);
+            std::string n = P::PartName(d.parts[i].part);
             for (auto& ch : n) ch = (char)tolower((unsigned char)ch);
             const char* cn = ClassName(d.parts[i].part);
             bool mesh = strstr(cn, "TriMesh") || strstr(cn, "Skin") || strstr(cn, "Dangly");
@@ -290,158 +446,120 @@ bool StartDoll(void* cre, void* gob) {
             if (pb < 0) continue;
             if (defs.size() >= 24) break;
             boneOf[i] = (int)defs.size();
-            defs.push_back({(int)i, pb, -1, 0.05f * gs, 0.8f, 0.5f});
+            // generic skeletons: limbs collide with each other but not with the body they hang from
+            defs.push_back({(int)i, pb, -1, 0.05f * gs, 0.8f, 0.5f, J_BALL, pb == 0 ? CAT_LEG : CAT_ARM});
         }
-        // tips: the first child bone that is away from the bone's origin
         for (size_t k = 0; k < defs.size(); k++)
             for (size_t j = k + 1; j < defs.size(); j++)
                 if (defs[j].parentBone == (int)k && Len(w[defs[j].part].p - w[defs[k].part].p) > 0.05f * gs) { defs[k].tip = defs[j].part; break; }
     }
     if (defs.size() < 2) { delete dp; return false; }
 
-    b3WorldDef wd = b3DefaultWorldDef();
-    wd.gravity = b3Vec3{0, 0, -9.81f};
-    d.world = b3CreateWorld(&wd);
-    // ground: the walkmesh around the body as a height grid; what is not walkable (walls, furniture)
-    // is raised so limbs do not sink into it
-    {
-        const int N = 29; const float cell = 0.25f;           // 7 x 7 m
-        std::vector<b3Vec3> v(N * N);
-        std::vector<char> walk(N * N, 0);
-        void* area = F<void*>(cre, OFS::Obj_Area);
-        float x0 = cp.x - cell * (N - 1) * 0.5f, y0 = cp.y - cell * (N - 1) * 0.5f;
-        int walkable = 0;
-        for (int j = 0; j < N; j++) for (int i = 0; i < N; i++) {
-            float h = d.ground;
-            bool ok = GroundAt(area, x0 + i * cell, y0 + j * cell, h);
-            if (ok && fabsf(h - d.ground) > 3.0f) ok = false;   // another floor
-            walk[j * N + i] = ok; walkable += ok;
-            v[j * N + i] = b3Vec3{x0 + i * cell, y0 + j * cell, ok ? h : d.ground};
-        }
-        if (walkable > 4) {
-            // blocked points: the height of a walkable neighbour plus a wall
-            for (int j = 0; j < N; j++) for (int i = 0; i < N; i++) {
-                if (walk[j * N + i]) continue;
-                float best = d.ground; float bd = 1e9f;
-                for (int dj = -3; dj <= 3; dj++) for (int di = -3; di <= 3; di++) {
-                    int ii = i + di, jj = j + dj;
-                    if (ii < 0 || jj < 0 || ii >= N || jj >= N || !walk[jj * N + ii]) continue;
-                    float dd = (float)(di * di + dj * dj);
-                    if (dd < bd) { bd = dd; best = v[jj * N + ii].z; }
-                }
-                v[j * N + i].z = best + 1.2f;
-            }
-            std::vector<int32_t> idx;
-            for (int j = 0; j + 1 < N; j++) for (int i = 0; i + 1 < N; i++) {
-                int a = j * N + i, b = a + 1, c = a + N, e = c + 1;
-                idx.insert(idx.end(), {a, b, e, a, e, c});
-            }
-            b3MeshDef md = {};
-            md.vertices = v.data(); md.indices = idx.data();
-            md.vertexCount = N * N; md.triangleCount = (int)idx.size() / 3;
-            md.useMedianSplit = true; md.identifyEdges = true;
-            d.mesh = b3CreateMesh(&md, nullptr, 0);
-        }
-        b3BodyDef bd = b3DefaultBodyDef();
-        b3BodyId g = b3CreateBody(d.world, &bd);
-        b3ShapeDef sd = b3DefaultShapeDef();
-        sd.baseMaterial.friction = 0.9f;
-        if (d.mesh) b3CreateMeshShape(g, &sd, d.mesh, b3Vec3{1, 1, 1});
-        else {
-            b3BoxHull box = b3MakeOffsetBoxHull(25.0f, 25.0f, 0.5f, b3Vec3{cp.x, cp.y, d.ground - 0.5f});
-            b3CreateHullShape(g, &sd, &box.base);
-        }
-    }
-    // pushed away from whoever dealt the killing blow (backwards if unknown)
-    V3 back = Rot(w[0].q, V3{0, -1, 0});               // models face +y
+    // starting motion: the death animation's own motion, plus a push away from the killer (or a blast)
+    V3 away = Rot(w[0].q, V3{0, -1, 0});               // models face +y: backwards
     V3 kp;
     if (KillerPos(cre, kp)) {
-        V3 away{cp.x - kp.x, cp.y - kp.y, 0};
-        float l = Len(away);
-        if (l > 0.05f) back = away * (1.0f / l);
-        if (C.debug) Log("ragdoll: killer at %.2f %.2f, pushed towards %.2f %.2f", kp.x, kp.y, back.x, back.y);
+        V3 a{cp.x - kp.x, cp.y - kp.y, 0};
+        float l = Len(a);
+        if (l > 0.05f) away = a * (1.0f / l);
     }
+    const P::Blast* blast = RecentBlast(d.anchor, 2.5);
+    if (blast) d.lastBlast = blast->serial;
+    V3 lateral = Rot(w[0].q, V3{1, 0, 0});
     for (size_t k = 0; k < defs.size(); k++) {
         const Def& df = defs[k];
-        Bone b; b.part = df.part; b.parent = df.parentBone; b.root = k == 0;
+        Bone b; b.part = df.part; b.parent = df.parentBone; b.root = k == 0; b.cat = df.cat; b.joint = df.joint;
+        b.cone = df.cone; b.twist = df.twist; b.radius = df.radius;
         b.wp = w[df.part].p; b.wq = w[df.part].q;
-        b3BodyDef bd = b3DefaultBodyDef();
-        bd.type = b3_dynamicBody;
-        bd.position = BV(b.wp);
-        bd.rotation = BQ(b.wq);
-        bd.linearDamping = 0.1f;
-        bd.angularDamping = 0.8f;
-        // the upper body falls backwards a little, as if hit from the front
-        float up = Len(b.wp - V3{cp.x, cp.y, cp.z});
-        bd.linearVelocity = BV(back * (C.push * fminf(1.0f, up / 1.4f)));
-        b.body = b3CreateBody(d.world, &bd);
-        b3ShapeDef sd = b3DefaultShapeDef();
-        sd.filter.groupIndex = -1;                    // no collisions inside the ragdoll
-        sd.baseMaterial.friction = 0.8f;
-        sd.baseMaterial.rollingResistance = 0.05f;
-        sd.density = 1000.0f;
+        // toppling: the whole body turns over its feet, away from the killer
+        float up = fmaxf(0.0f, b.wp.z - d.anchor.z);
+        float tip = fminf(1.0f, up / (1.4f * gs));
+        V3 axis = Cross(V3{0, 0, 1}, away);
+        V3 v = Cross(axis, b.wp - d.anchor) * (C.push / (1.4f * gs));
+        V3 av{};
+        if (prevW && prevDt > 0.004f) {
+            const WT& pw = (*prevW)[df.part];
+            v = v + ClampLen((b.wp - pw.p) * (1.0f / prevDt), 6.0f);
+            av = ClampLen(AngVel(pw.q, b.wq, prevDt), 12.0f);
+        }
+        if (blast) v = v + P::BlastVelocity(*blast, b.wp) * (0.7f + 0.3f * tip);
+        b.v = v; b.w = av;
+        // shape
         V3 tipLocal;
+        float len = 0;
         if (df.tip >= 0) tipLocal = Rot(Conj(b.wq), w[df.tip].p - b.wp);
         else if (b.root) {
-            // pelvis: across the hips
             int lt = FindPart(d, "lthigh_g"), rt = FindPart(d, "rthigh_g");
             if (lt >= 0 && rt >= 0) {
-                V3 a = Rot(Conj(b.wq), w[lt].p - b.wp), c = Rot(Conj(b.wq), w[rt].p - b.wp);
-                b3Capsule cap{BV(a), BV(c), df.radius};
-                b3CreateCapsuleShape(b.body, &sd, &cap);
+                b.a = Rot(Conj(b.wq), w[lt].p - b.wp); b.b = Rot(Conj(b.wq), w[rt].p - b.wp);
+                b.capsule = true;
                 d.bones.push_back(b);
                 continue;
             }
             tipLocal = V3{0, 0, 0.15f * gs};
         } else tipLocal = V3{0, 0, -0.18f * gs};
-        float len = Len(tipLocal);
-        if (len < 0.02f) { b3Sphere sp{b3Vec3{0, 0, 0}, df.radius}; b3CreateSphereShape(b.body, &sd, &sp); }
+        len = Len(tipLocal);
+        if (len < 0.02f) b.capsule = false;
         else {
             V3 dir = tipLocal * (1.0f / len);
             float r = fminf(df.radius, len * 0.45f);
-            b3Capsule cap{BV(dir * r), BV(tipLocal - dir * r), r};
-            b3CreateCapsuleShape(b.body, &sd, &cap);
+            b.radius = r; b.a = dir * r; b.b = tipLocal - dir * r;
         }
-        d.bones.push_back(b);
-        // joint to the parent bone at this bone's origin; z axes along the child bone
+        // joint frames at this bone's origin
         if (df.parentBone >= 0) {
             Bone& pb = d.bones[df.parentBone];
-            V3 axisW = Rot(b.wq, len > 0.02f ? tipLocal * (1.0f / len) : V3{0, 0, 1});
-            Q4 frameW = FromTo(V3{0, 0, 1}, axisW);
-            b3SphericalJointDef jd = b3DefaultSphericalJointDef();
-            jd.base.bodyIdA = pb.body;
-            jd.base.bodyIdB = b.body;
-            jd.base.localFrameA.p = BV(Rot(Conj(pb.wq), b.wp - pb.wp));
-            jd.base.localFrameA.q = BQ(Norm(Conj(pb.wq) * frameW));
-            jd.base.localFrameB.p = b3Vec3{0, 0, 0};
-            jd.base.localFrameB.q = BQ(Norm(Conj(b.wq) * frameW));
-            jd.base.collideConnected = false;
-            jd.enableConeLimit = true;
-            jd.coneAngle = df.cone;
-            jd.enableTwistLimit = true;
-            jd.lowerTwistAngle = -df.twist;
-            jd.upperTwistAngle = df.twist;
-            jd.enableSpring = true;                    // a little muscle tone left
-            jd.hertz = 0.6f;
-            jd.dampingRatio = 0.4f;
-            jd.targetRotation = BQ(Q4{});
-            b3CreateSphericalJoint(d.world, &jd);
+            V3 dirW = Rot(b.wq, len > 0.02f ? tipLocal * (1.0f / len) : V3{0, 0, 1});
+            Q4 frameW;
+            if (df.joint == J_HINGE) {
+                // knees and elbows bend one way only: hinge across the limb, flexion positive
+                V3 parentDir = b.wp - pb.wp;
+                float pl = Len(parentDir);
+                parentDir = pl > 1e-4f ? parentDir * (1.0f / pl) : dirW;
+                bool knee = df.cat == CAT_LEG;
+                V3 axis = Cross(parentDir, dirW);
+                float bend = atan2f(Len(axis), Dot(parentDir, dirW));
+                if (bend > 0.25f) axis = axis * (1.0f / Len(axis));
+                else {
+                    // nearly straight: knees fold backwards, elbows forwards
+                    axis = knee ? lateral * -1.0f : lateral;
+                    axis = axis - parentDir * Dot(axis, parentDir);
+                    float al = Len(axis);
+                    axis = al > 1e-3f ? axis * (1.0f / al) : Rot(pb.wq, V3{1, 0, 0});
+                    bend = atan2f(Dot(Cross(parentDir, dirW), axis), Dot(parentDir, dirW));
+                }
+                frameW = FromTo(V3{0, 0, 1}, axis);
+                b.lower = fminf(-0.03f - bend, 0.0f);
+                b.upper = fmaxf(2.5f - bend, 0.0f);
+            } else frameW = FromTo(V3{0, 0, 1}, dirW);
+            b.frameA.p = BV(Rot(Conj(pb.wq), b.wp - pb.wp));
+            b.frameA.q = BQ(Norm(Conj(pb.wq) * frameW));
+            b.frameB.p = b3Vec3{0, 0, 0};
+            b.frameB.q = BQ(Norm(Conj(b.wq) * frameW));
         }
+        d.bones.push_back(b);
     }
     for (size_t k = 0; k < d.bones.size(); k++) d.parts[d.bones[k].part].bone = (int)k;
+    CollectDrops(d, away * C.push);
+    BuildWorld(d, F<void*>(cre, OFS::Obj_Area), d.muscle > 0);
     g_dolls[d.id] = dp;
     g_byGob[gob] = dp;
-    Log("ragdoll: %08x '%s' %s, %d parts, %d bones", d.id, PartName(d.parts[0].part), humanoid ? "humanoid" : "generic", (int)d.parts.size(), (int)d.bones.size());
+    for (auto& x : dp->drops) g_dropByGob[x.gob] = &x;
+    Log("ragdoll: %08x '%s' %s, %d parts, %d bones, %d dropped%s%s", d.id, P::PartName(d.parts[0].part), humanoid ? "humanoid" : "generic",
+        (int)d.parts.size(), (int)d.bones.size(), (int)d.drops.size(), prevW ? ", animated start" : "", blast ? ", blast" : "");
     return true;
+}
+
+void ForgetDrops(Doll& d) {
+    for (auto& x : d.drops) { auto it = g_dropByGob.find(x.gob); if (it != g_dropByGob.end() && it->second == &x) g_dropByGob.erase(it); }
 }
 
 void FreeDoll(Doll* d, bool restore = false) {
     if (!d) return;
-    // give the animation back (creature alive again): restore the frozen locals once
     if (restore && g_byGob.count(d->gob)) {
         for (auto& r : d->parts) if (Readable(r.part, 0x30)) { F<V3>(r.part, 0x10) = r.lp; F<Q4>(r.part, 0x1c) = r.lq; }
     }
     DestroyWorld(*d);
+    ForgetDrops(*d);
     g_byGob.erase(d->gob);
     g_dolls.erase(d->id);
     delete d;
@@ -451,7 +569,7 @@ void FreeDoll(Doll* d, bool restore = false) {
 bool Rebind(Doll& d, void* gob) {
     std::vector<std::string> names;
     std::vector<Bone> old = d.bones;
-    for (auto& b : old) names.push_back(PartName(d.parts[b.part].part));
+    for (auto& b : old) names.push_back(P::PartName(d.parts[b.part].part));
     g_byGob.erase(d.gob);
     d.gob = gob;
     d.parts.clear();
@@ -460,36 +578,50 @@ bool Rebind(Doll& d, void* gob) {
     for (size_t k = 0; k < old.size(); k++) {
         int p = FindPart(d, names[k].c_str());
         if (p < 0) continue;
-        Bone b = old[k]; b.part = p; b.body = b3_nullBodyId;
-        b.parent = -1;
+        Bone b = old[k]; b.part = p; b.body = b3_nullBodyId; b.jid = b3_nullJointId;
+        b.parent = -1; b.joint = J_NONE;          // joints are not rebuilt for this model
         d.bones.push_back(b);
         d.parts[p].bone = (int)d.bones.size() - 1;
     }
+    // weapons on the new model: keep the old resting places in the same order
+    std::vector<Drop> oldDrops = d.drops;
+    ForgetDrops(d);
+    d.drops.clear();
+    void** list = F<void**>(gob, 0x4a8); int n = F<int>(gob, 0x4b0);
+    size_t k = 0;
+    for (int i = 0; list && i < n && i < 16 && k < oldDrops.size(); i++) {
+        void* c = list[i];
+        if (!HandAttachment(c, nullptr)) continue;
+        Drop x = oldDrops[k++]; x.gob = c; x.body = b3_nullBodyId;
+        d.drops.push_back(x);
+    }
+    for (auto& x : d.drops) g_dropByGob[x.gob] = &x;
     g_byGob[gob] = &d;
-    Log("ragdoll: %08x model rebuilt, %d bones kept", d.id, (int)d.bones.size());
+    Log("ragdoll: %08x model rebuilt, %d bones, %d dropped kept", d.id, (int)d.bones.size(), (int)d.drops.size());
     return !d.bones.empty() && d.bones[0].root;
 }
 
 void Settle(Doll& d) {
     d.done = true;
     DestroyWorld(d);
-    // single player: put the corpse object under the body (looting and selection follow)
-    if (C.reposition && !d.moved) {
-        void* sc = ServerCreature(d.id);
-        if (sc && fSrvSetPosition && d.bones.size()) {
-            V3 b = d.bones[0].wp;
-            V3 np{b.x, b.y, d.anchor.z};
-            V3 off = np - d.anchor;
-            float l = sqrtf(off.x * off.x + off.y * off.y);
-            if (l > 2.0f) { np = d.anchor + off * (2.0f / l); np.z = d.anchor.z; }
-            if (l > 0.05f) { fSrvSetPosition(sc, &np, 0); Log("ragdoll: %08x corpse moved %.2f m", d.id, l); }
-            d.moved = true;
+    if (C.reposition && d.bones.size() && P::ServerCreature(d.id)) {
+        V3 b = d.bones[0].wp;
+        V3 np{b.x, b.y, d.anchor.z};
+        V3 off = np - d.anchor;
+        float l = sqrtf(off.x * off.x + off.y * off.y);
+        float maxMove = d.lastBlast ? 8.0f : 2.5f;
+        if (l > maxMove) { np = d.anchor + off * (maxMove / l); np.z = d.anchor.z; }
+        if (l > 0.05f && P::SetServerPosition(d.id, np)) {
+            Log("ragdoll: %08x corpse moved %.2f m", d.id, l);
+            d.anchor = np;
         }
+        d.moved = true;
     }
 }
 
 void Step(Doll& d, float dt) {
     if (d.done || !b3World_IsValid(d.world)) return;
+    UpdateMuscles(d);
     b3World_Step(d.world, dt, 4);
     d.t += dt;
     float maxV = 0;
@@ -499,8 +631,14 @@ void Step(Doll& d, float dt) {
         V3 lv = VB(b3Body_GetLinearVelocity(b.body)), av = VB(b3Body_GetAngularVelocity(b.body));
         maxV = fmaxf(maxV, fmaxf(Len(lv), Len(av) * 0.15f));
     }
+    for (auto& x : d.drops) {
+        b3WorldTransform tf = b3Body_GetTransform(x.body);
+        x.wp = VB(tf.p); x.wq = Norm(QB(tf.q));
+        V3 lv = VB(b3Body_GetLinearVelocity(x.body)), av = VB(b3Body_GetAngularVelocity(x.body));
+        maxV = fmaxf(maxV, fmaxf(Len(lv), Len(av) * 0.1f));
+    }
     // against a remote server the corpse stays where it is: keep the body over it
-    bool canMove = C.reposition && ServerCreature(d.id) != nullptr;
+    bool canMove = C.reposition && P::ServerCreature(d.id) != nullptr;
     if (!canMove && d.bones.size()) {
         Bone& r = d.bones[0];
         V3 off = r.wp - d.anchor; off.z = 0;
@@ -519,8 +657,31 @@ void Step(Doll& d, float dt) {
         Settle(d);
         if (C.debug) {
             Log("ragdoll: %08x settled after %.1f s (ground %.2f, corpse at %.2f %.2f)", d.id, d.t, d.ground, d.anchor.x, d.anchor.y);
-            for (auto& b : d.bones) Log("ragdoll:   %-12s %.2f %.2f %.2f", PartName(d.parts[b.part].part), b.wp.x, b.wp.y, b.wp.z);
+            for (auto& b : d.bones) Log("ragdoll:   %-12s %.2f %.2f %.2f", P::PartName(d.parts[b.part].part), b.wp.x, b.wp.y, b.wp.z);
+            for (auto& x : d.drops) Log("ragdoll:   drop at %.2f %.2f %.2f", x.wp.x, x.wp.y, x.wp.z);
         }
+    }
+}
+
+// a blast near a body: wake it (or add to its motion)
+void ApplyBlast(Doll& d, const P::Blast& bl, void* area) {
+    if (d.lastBlast == bl.serial || d.bones.empty()) return;
+    V3 c = d.bones[0].wp;
+    V3 dd = c - bl.p;
+    if (dd.x * dd.x + dd.y * dd.y > bl.radius * bl.radius) return;
+    d.lastBlast = bl.serial;
+    if (d.done) {
+        bool joints = true;
+        for (size_t k = 1; k < d.bones.size(); k++) if (d.bones[k].joint == J_NONE) joints = false;
+        if (!joints) return;                      // model was rebuilt: the skeleton is not jointed any more
+        for (auto& b : d.bones) { b.v = P::BlastVelocity(bl, b.wp) * P::Rand(0.85f, 1.15f); b.w = V3{P::Rand(-2, 2), P::Rand(-2, 2), P::Rand(-2, 2)}; }
+        for (auto& x : d.drops) { x.v = P::BlastVelocity(bl, x.wp) * 1.3f; x.w = V3{P::Rand(-8, 8), P::Rand(-8, 8), P::Rand(-8, 8)}; }
+        d.muscle = 0;
+        BuildWorld(d, area, false);
+        Log("ragdoll: %08x thrown by a blast", d.id);
+    } else {
+        for (auto& b : d.bones) b3Body_SetLinearVelocity(b.body, BV(VB(b3Body_GetLinearVelocity(b.body)) + P::BlastVelocity(bl, b.wp)));
+        for (auto& x : d.drops) b3Body_SetLinearVelocity(x.body, BV(VB(b3Body_GetLinearVelocity(x.body)) + P::BlastVelocity(bl, x.wp) * 1.3f));
     }
 }
 
@@ -541,46 +702,69 @@ void DevCommands() {
         }
         return;
     }
-    if (strncmp(line, "ground", 6) == 0) {
-        void* pl = Player(); void* area = PlayerArea();
-        if (pl) {
-            Vec3 p = Pos(pl);
-            for (int dy = -6; dy <= 6; dy++) {
-                char row[256] = {}; int k = 0;
-                for (int dx = -8; dx <= 8; dx++) {
-                    float h = 0; bool ok = GroundAt(area, p.x + dx * 0.5f, p.y + dy * 0.5f, h);
-                    k += sprintf(row + k, ok ? "%6.2f " : "  ---  ", h);
-                }
-                Log("ground y%+d: %s", dy, row);
-            }
-            Log("player z %.2f", p.z);
+    if (strncmp(line, "objs", 4) == 0) {
+        void* area = PlayerArea();
+        int n = area ? F<int>(area, OFS::Area_ObjCount) : 0;
+        uint32_t* ids = area ? F<uint32_t*>(area, OFS::Area_ObjIds) : nullptr;
+        for (int i = 0; ids && i < n; i++) {
+            void* o = GetObj(ids[i]);
+            if (!o) { Log("dev: %08x (no object)", ids[i]); continue; }
+            Vec3 p = Pos(o);
+            Log("dev: %08x type %d %s at %.1f %.1f %.1f gob %p", ids[i], Type(o), ClassName(o), p.x, p.y, p.z, P::ObjectGob(o));
         }
+        return;
+    }
+    if (strncmp(line, "blast ", 6) == 0) {    // blast <x> <y> <z>: a fireball-sized push
+        V3 p;
+        if (sscanf(line + 6, "%f %f %f", &p.x, &p.y, &p.z) == 3) {
+            P::Blast b{p, 6.5f, 5.0f, false, P::Now(), 0x80000000u + (uint32_t)GetTickCount()};
+            for (auto& kv : g_dolls) ApplyBlast(*kv.second, b, PlayerArea());
+            Props_Blast(b);
+            Log("dev: blast at %.1f %.1f %.1f", p.x, p.y, p.z);
+        }
+        return;
+    }
+    if (strncmp(line, "hostile ", 8) == 0) {  // put a creature in the hostile faction (single player)
+        uint32_t id = (uint32_t)strtoul(line + 8, nullptr, 16);
+        void* srv = P::ServerApp();
+        void* in = srv ? F<void*>(srv, 8) : nullptr;
+        void* mgr = in ? F<void*>(in, 0x100b0) : nullptr;
+        typedef void* (*gf_t)(void*, int);
+        typedef void (*am_t)(void*, uint32_t, int);
+        void* fac = mgr ? ((gf_t)A(0x140355c80))(mgr, 1) : nullptr;
+        Log("dev: hostile %08x mgr %p faction %p", id, mgr, fac);
+        if (fac) ((am_t)A(0x1404ab900))(fac, id & 0x7fffffffu, 1);
         return;
     }
     if (strncmp(line, "kill ", 5) == 0) {
         uint32_t id = (uint32_t)strtoul(line + 5, nullptr, 16);
-        void* sc = ServerCreature(id);
+        void* sc = P::ServerCreature(id);
         typedef void (*dmg_t)(void*, int);
         static dmg_t fDmg = (dmg_t)GetProcAddress(GetModuleHandleA(nullptr), "?DoDamage@CNWSCreature@@UEAAXH@Z");
         Log("dev: kill %08x -> %p", id, sc);
-        if (sc) { void* so = VCall<void* (*)(void*)>(sc, 0x20)(sc); if (so) F<uint32_t>(so, 0x198) = 0x7fffffff; }   // killed by the player
+        if (sc) { void* so = VCall<void* (*)(void*)>(sc, 0x20)(sc); if (so) F<uint32_t>(so, 0x198) = 0x7fffffff; }
         if (sc && fDmg) fDmg(sc, 1000);
+        // what the death effect does: the "dead" activity starts the death animation
+        typedef void (*uaq_t)(void*);
+        if (sc) ((uaq_t)A(0x1403a4550))(sc);         // CNWSCreature::UpdateActionQueue
+        return;
     }
+    Props_DevCommand(line);
 }
 
 // once per rendered frame, before the scene animates: watch deaths, step the simulations
 void Update() {
-    LARGE_INTEGER now; QueryPerformanceCounter(&now);
-    double dt = g_last.QuadPart ? (double)(now.QuadPart - g_last.QuadPart) / g_freq.QuadPart : 0;
-    if (g_last.QuadPart && dt < 0.002) return;            // other scenes of the same frame
-    g_last = now;
+    double now = P::Now();
+    double dt = g_lastUpdate > 0 ? now - g_lastUpdate : 0;
+    if (g_lastUpdate > 0 && dt < 0.002) return;            // other scenes of the same frame
+    g_lastUpdate = now;
     if (dt > 0.25) dt = 0.25;
     DevCommands();
+    P::PollBlasts();
     void* pl = Player();
     void* area = PlayerArea();
     static void* lastArea = nullptr;
-    if (area != lastArea) { lastArea = area; g_dead.clear(); }
-    // forget creatures that are gone (area change, destroyed corpses)
+    if (area != lastArea) { lastArea = area; g_dead.clear(); g_pending.clear(); }
     for (auto it = g_dolls.begin(); it != g_dolls.end();) {
         Doll* d = it->second; ++it;
         void* c = GetObj(d->id);
@@ -588,21 +772,26 @@ void Update() {
         void* g = CreatureGob(c);
         if (g != d->gob) {
             if (g && d->done && Rebind(*d, g)) continue;
-            g_byGob.erase(d->gob); d->gob = nullptr;     // old model is gone: nothing to restore
+            g_byGob.erase(d->gob); d->gob = nullptr;
             FreeDoll(d);
         }
+    }
+    // pending deaths whose model went away
+    for (auto it = g_pending.begin(); it != g_pending.end();) {
+        void* c = GetObj(it->second.id);
+        if (!c || CreatureGob(c) != it->first || now - it->second.t0 > 3.0) it = g_pending.erase(it); else ++it;
     }
     if (!pl || !area) { g_dead.clear(); return; }
     int n = F<int>(area, OFS::Area_ObjCount);
     uint32_t* ids = F<uint32_t*>(area, OFS::Area_ObjIds);
     Vec3 pp = Pos(pl);
-    int active = 0;
+    int active = (int)g_pending.size();
     for (auto& kv : g_dolls) if (!kv.second->done) active++;
     for (int i = 0; ids && i < n && i < 100000; i++) {
         void* o = GetObj(ids[i]);
         if (!o || Type(o) != OT_CREATURE) continue;
         uint32_t id = ids[i];
-        void* sc = ServerCreature(id);
+        void* sc = P::ServerCreature(id);
         bool dead = sc && fSrvGetDead ? fSrvGetDead(sc) != 0 : ClientDead(o);
         auto it = g_dead.find(id);
         bool known = it != g_dead.end();
@@ -612,20 +801,33 @@ void Update() {
             Vec3 p = Pos(o);
             float dx = p.x - pp.x, dy = p.y - pp.y;
             void* gob = CreatureGob(o);
-            if (gob && dx * dx + dy * dy < C.range * C.range && active < C.maxActive && !g_dolls.count(id)) {
-                if (StartDoll(o, gob)) active++;
+            if (gob && dx * dx + dy * dy < C.range * C.range && active < C.maxActive && !g_dolls.count(id) && !g_pending.count(gob)) {
+                if (C.animLead > 0.01f) { g_pending[gob] = Pending{id, gob, now}; active++; }
+                else if (StartDoll(o, gob, nullptr, 0)) active++;
             }
         }
-        if (!dead && was) { auto d = g_dolls.find(id); if (d != g_dolls.end()) { Log("ragdoll: %08x alive again", id); FreeDoll(d->second, true); } }
+        if (!dead && was) {
+            auto d = g_dolls.find(id);
+            if (d != g_dolls.end()) { Log("ragdoll: %08x alive again", id); FreeDoll(d->second, true); }
+            for (auto pit = g_pending.begin(); pit != g_pending.end(); ++pit) if (pit->second.id == id) { g_pending.erase(pit); break; }
+        }
+    }
+    // blasts
+    for (auto& bl : P::Blasts()) {
+        if (now - bl.t > 0.5) continue;
+        for (auto& kv : g_dolls) ApplyBlast(*kv.second, bl, area);
+        Props_Blast(bl);
     }
     // fixed 60 Hz steps
     g_acc += dt;
     int steps = 0;
     while (g_acc >= 1.0 / 60 && steps < 4) {
         for (auto& kv : g_dolls) Step(*kv.second, 1.0f / 60);
+        Props_Step(1.0f / 60);
         g_acc -= 1.0 / 60; steps++;
     }
     if (steps == 4) g_acc = 0;
+    Props_Update(area);
 }
 
 void hk_SceneAnimate(void* scene, float dt) {
@@ -635,13 +837,51 @@ void hk_SceneAnimate(void* scene, float dt) {
 
 void hk_GobAnimate(void* gob, float dt) {
     o_GobAnimate(gob, dt);
-    auto it = g_byGob.find(gob);
-    if (it == g_byGob.end()) return;
-    Doll& d = *it->second;
-    // freeze the pose from the moment of death, then pose the bones from the bodies
-    for (auto& r : d.parts) { F<V3>(r.part, 0x10) = r.lp; F<Q4>(r.part, 0x1c) = r.lq; }
-    std::vector<WT> w;
-    ComputeWorld(d, w, true);
+    auto pit = g_pending.find(gob);
+    if (pit != g_pending.end()) {
+        // death animation still playing: remember this pose, start the ragdoll when the lead time is over
+        Pending& pd = pit->second;
+        double now = P::Now();
+        // the server says dead a moment before the death animation starts: wait until the body moves,
+        // let the animation carry it for the lead time, then take over with its momentum
+        bool go = now - pd.t0 > (C.debug > 1 ? 4.0 : 1.6) || (pd.moveT > 0 && now - pd.moveT >= C.animLead);
+        if (go && !pd.prev.empty()) {
+            void* c = GetObj(pd.id);
+            std::vector<WT> prev = pd.prev; float pdt = (float)(now - pd.lastT);
+            g_pending.erase(pit);
+            if (c) StartDoll(c, gob, &prev, pdt);
+        } else {
+            TreeWorld(F<void*>(gob, 0x90), pd.prev, P::GobScale(gob));
+            pd.lastT = now;
+            if (pd.first.empty()) pd.first = pd.prev;
+            else if (pd.moveT <= 0 && pd.first.size() == pd.prev.size()) {
+                float sum = 0;
+                for (size_t i = 0; i < pd.prev.size(); i++) sum += Len(pd.prev[i].p - pd.first[i].p);
+                if (C.debug > 1) Log("ragdoll: %08x pending %.2f s, moved %.3f", pd.id, now - pd.t0, sum / pd.prev.size());
+                if (sum / pd.prev.size() > 0.05f * P::GobScale(gob)) { pd.moveT = now; if (C.debug) Log("ragdoll: %08x death animation moving after %.2f s", pd.id, now - pd.t0); }
+            }
+        }
+    } else {
+        auto it = g_byGob.find(gob);
+        if (it != g_byGob.end()) {
+            Doll& d = *it->second;
+            for (auto& r : d.parts) { F<V3>(r.part, 0x10) = r.lp; F<Q4>(r.part, 0x1c) = r.lq; }
+            std::vector<WT> w;
+            ComputeWorld(d, w, true);
+        }
+    }
+    Cloth_AfterAnimate(gob);
+}
+
+// weapons that left the hand: the attachment keeps putting them in the hand, we put them back where they lie
+int hk_AttachControl(void* beh, float dt) {
+    int r = o_AttachControl(beh, dt);
+    if (!g_dropByGob.empty()) {
+        void* child = F<void*>(beh, 0x18);
+        auto it = g_dropByGob.find(child);
+        if (it != g_dropByGob.end()) P::SetGobTransform(child, it->second->wp, it->second->wq);
+    }
+    return r;
 }
 
 int IniInt(const char* sec, const char* key, int def, const char* ini) { return GetPrivateProfileIntA(sec, key, def, ini); }
@@ -655,44 +895,38 @@ void Ragdoll_LoadConfig(const char* ini) {
     C.enabled = IniInt("Ragdoll", "Enabled", 1, ini);
     C.reposition = IniInt("Ragdoll", "MoveCorpseSinglePlayer", 1, ini);
     C.pinRadius = IniFloat("Ragdoll", "MultiplayerPinRadius", 0.6f, ini);
-    C.push = IniFloat("Ragdoll", "DeathPush", 1.2f, ini);
+    C.push = IniFloat("Ragdoll", "DeathPush", 2.0f, ini);
+    C.animLead = IniFloat("Ragdoll", "DeathAnimationSeconds", 0.35f, ini);
+    C.muscle = IniFloat("Ragdoll", "MuscleTone", 1.0f, ini);
     C.settleTime = IniFloat("Ragdoll", "MaxSimulationSeconds", 6.0f, ini);
     C.maxActive = IniInt("Ragdoll", "MaxActive", 10, ini);
     C.range = IniFloat("Ragdoll", "Range", 45.0f, ini);
+    C.dropWeapons = IniInt("Ragdoll", "DropWeapons", 1, ini);
+    C.explosions = IniInt("Physics", "Explosions", 1, ini);
     C.debug = IniInt("Ragdoll", "Debug", 0, ini);
     GetPrivateProfileStringA("Developer", "CommandFile", "", C.devFile, sizeof C.devFile, ini);
-    Log("config: enabled %d moveCorpse %d pin %.2f push %.2f maxTime %.1f maxActive %d range %.0f",
-        C.enabled, C.reposition, C.pinRadius, C.push, C.settleTime, C.maxActive, C.range);
+    Log("config: enabled %d moveCorpse %d pin %.2f push %.2f lead %.2f muscle %.2f maxTime %.1f maxActive %d range %.0f drop %d blasts %d",
+        C.enabled, C.reposition, C.pinRadius, C.push, C.animLead, C.muscle, C.settleTime, C.maxActive, C.range, C.dropWeapons, C.explosions);
+    Props_LoadConfig(ini);
+    Cloth_LoadConfig(ini);
 }
 
 void Ragdoll_Install() {
     HMODULE exe = GetModuleHandleA(nullptr);
-    QueryPerformanceFrequency(&g_freq);
-    p_AppManager = (void**)GetProcAddress(exe, "?g_pAppManager@@3PEAVCAppManager@@EA");
-    fToCanonical = (Rot_t)GetProcAddress(exe, "?RotateRealToCanonicalTile@CNWTile@@QEAAXMMPEAM0@Z");
-    fFindTri = (FindTri_t)GetProcAddress(exe, "?FindTriangle@CNWTileSurfaceMesh@@QEAAHHHMMH@Z");
-    fMeshHeight = (Height_t)GetProcAddress(exe, "?ComputeHeight@CNWTileSurfaceMesh@@QEAAMVVector@@@Z");
-    {   // not exported: check its first bytes
-        static const uint8_t sig[8] = {0};
-        uint8_t* p = (uint8_t*)A(0x1407d9d00);
-        char hex[40]; for (int i = 0; i < 8; i++) sprintf(hex + i * 3, "%02x ", p[i]);
-        Log("GetTile bytes %s", hex);
-        fGetTile = (GetTile_t)p;
-        (void)sig;
-    }
-    Log("ground fns %p %p %p", (void*)fToCanonical, (void*)fFindTri, (void*)fMeshHeight);
-    fGetWorld = (GetWorld_t)GetProcAddress(exe, "?GetWorld@Part@@UEAAXAEAVVector@@AEAVQuaternion@@@Z");
-    fSrvCreature = (GetCreature_t)GetProcAddress(exe, "?GetCreatureByGameObjectID@CServerExoApp@@QEAAPEAVCNWSCreature@@I@Z");
-    fSrvSetPosition = (SetPos_t)GetProcAddress(exe, "?SetPosition@CNWSObject@@QEAAXVVector@@H@Z");
+    if (!P::Init()) { Log("required exports missing - disabled"); return; }
     fSrvGetDead = (GetDead_t)GetProcAddress(exe, "?GetDead@CNWSObject@@QEAAHXZ");
     void* ga = (void*)GetProcAddress(exe, "?Animate@Gob@@UEAAXM@Z");
     void* sa = (void*)GetProcAddress(exe, "?Animate@Scene@@UEAAXM@Z");
-    Log("exports: getworld %p srvcreature %p setpos %p getdead %p gob %p scene %p", (void*)fGetWorld, (void*)fSrvCreature,
-        (void*)fSrvSetPosition, (void*)fSrvGetDead, ga, sa);
-    if (!fGetWorld || !ga || !sa) { Log("required exports missing - disabled"); return; }
+    void* ac = (void*)GetProcAddress(exe, "?Control@CAurBehaviorAttach@@UEAAHM@Z");
+    if (!ga || !sa) { Log("animate exports missing - disabled"); return; }
     if (MH_CreateHook(ga, (void*)hk_GobAnimate, (void**)&o_GobAnimate) != MH_OK || MH_EnableHook(ga) != MH_OK ||
         MH_CreateHook(sa, (void*)hk_SceneAnimate, (void**)&o_SceneAnimate) != MH_OK || MH_EnableHook(sa) != MH_OK) {
         Log("hooks failed - disabled"); return;
     }
+    if (ac && MH_CreateHook(ac, (void*)hk_AttachControl, (void**)&o_AttachControl) == MH_OK && MH_EnableHook(ac) == MH_OK) Log("attach hook ready");
+    else { Log("attach hook failed - weapons stay in the hands"); C.dropWeapons = 0; }
+    P::InstallBlastHook();
+    Props_Install();
+    Cloth_Install();
     Log("ready");
 }
