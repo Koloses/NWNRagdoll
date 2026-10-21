@@ -3,7 +3,7 @@
 Ragdoll physics for dying creatures in **Neverwinter Nights: Enhanced Edition** (Windows, build
 8193.37). When a creature dies its body falls with real physics instead of playing the canned
 death animation: it crumples, tips over, slides off steps and comes to rest on the ground the way it
-landed. Physics by [Box3D](https://github.com/erincatto/box3d) (Erin Catto, MIT).
+landed, knocked away from whoever dealt the killing blow. Physics by [Box3D](https://github.com/erincatto/box3d) (Erin Catto, MIT).
 
 It is purely visual on your machine, nothing is sent to a server, and it works next to NWNPad.
 
@@ -29,7 +29,7 @@ uninstall. Other game builds are detected and the mod stays off.
 | Enabled | 1 | |
 | MoveCorpseSinglePlayer | 1 | move the corpse under the body when the server runs on this PC |
 | MultiplayerPinRadius | 0.6 | otherwise, how far the body may end up from the corpse (m) |
-| DeathPush | 1.2 | backwards speed of the upper body at the moment of death (m/s) |
+| DeathPush | 1.2 | speed of the upper body away from the killer at the moment of death (m/s) |
 | MaxSimulationSeconds | 6 | simulation time limit per body |
 | MaxActive | 10 | bodies simulated at the same time |
 | Range | 45 | only deaths this close to you (m) |
@@ -40,7 +40,8 @@ uninstall. Other game builds are detected and the mod stays off.
 exported `Scene::Animate` (once per frame: watch deaths, step the simulations at 60 Hz) and
 `Gob::Animate` (right after the engine animates a creature model: freeze the pose from the moment of
 death and set the bone rotations from the rigid bodies). Death is read from the in-process server in
-single player (`CNWSObject::GetDead`) and from the client's damage level otherwise. See
+single player (`CNWSObject::GetDead`) and from the client's damage level otherwise. The killer is the
+server's last damager (CNWSObject+0x198) in single player; online the closest creature of the other side. See
 `docs/RE_NOTES.md`.
 
 ## Building

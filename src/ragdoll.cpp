@@ -196,6 +196,42 @@ void DestroyWorld(Doll& d) {
     for (auto& b : d.bones) b.body = b3_nullBodyId;
 }
 
+// where the killing blow came from: the server's "last damager" in single player; online, the closest
+// creature on the other side (your party for enemies, the nearest hostile for everyone else)
+bool KillerPos(void* cre, V3& out) {
+    Vec3 cp = Pos(cre);
+    void* sc = ServerCreature(Id(cre));
+    if (sc) {
+        typedef void* (*as_t)(void*);
+        void* so = VCall<as_t>(sc, 0x20)(sc);                  // AsNWSObject
+        uint32_t dmg = so ? F<uint32_t>(so, 0x198) : 0x7f000000;
+        static auto fGetObj = (void* (*)(void*, uint32_t))GetProcAddress(GetModuleHandleA(nullptr), "?GetGameObject@CServerExoApp@@QEAAPEAVCGameObject@@I@Z");
+        if (dmg != 0x7f000000 && dmg != (Id(cre) & 0x7fffffffu) && fGetObj) {
+            void* g = fGetObj(ServerApp(), dmg);
+            void* o = g ? VCall<as_t>(g, 0x20)(g) : nullptr;
+            if (o) { out = F<V3>(o, 0xa4); if (C.debug) Log("ragdoll: killer %08x", dmg); return true; }
+        }
+    }
+    void* pl = Player();
+    void* area = PlayerArea();
+    if (!pl || !area) return false;
+    bool enemy = F<uint8_t>(cre, OFS::Cre_Reaction) >= 2;
+    int n = F<int>(area, OFS::Area_ObjCount);
+    uint32_t* ids = F<uint32_t*>(area, OFS::Area_ObjIds);
+    float best = 1e9f;
+    for (int i = 0; ids && i < n; i++) {
+        void* o = GetObj(ids[i]);
+        if (!o || o == cre || Type(o) != OT_CREATURE || ClientDead(o)) continue;
+        bool party = o == pl || F<uint32_t>(o, 0x270) == Id(pl);
+        bool hostile = F<uint8_t>(o, OFS::Cre_Reaction) >= 2;
+        if (enemy ? !party : !hostile) continue;
+        Vec3 p = Pos(o);
+        float d = (p.x - cp.x) * (p.x - cp.x) + (p.y - cp.y) * (p.y - cp.y);
+        if (d < best && d < 30.0f * 30.0f) { best = d; out = V3{p.x, p.y, p.z}; }
+    }
+    return best < 1e9f;
+}
+
 bool StartDoll(void* cre, void* gob) {
     Doll* dp = new Doll();
     Doll& d = *dp;
@@ -316,8 +352,15 @@ bool StartDoll(void* cre, void* gob) {
             b3CreateHullShape(g, &sd, &box.base);
         }
     }
-    Q4 facing = w[0].q;
-    V3 back = Rot(facing, V3{0, -1, 0});               // models face +y
+    // pushed away from whoever dealt the killing blow (backwards if unknown)
+    V3 back = Rot(w[0].q, V3{0, -1, 0});               // models face +y
+    V3 kp;
+    if (KillerPos(cre, kp)) {
+        V3 away{cp.x - kp.x, cp.y - kp.y, 0};
+        float l = Len(away);
+        if (l > 0.05f) back = away * (1.0f / l);
+        if (C.debug) Log("ragdoll: killer at %.2f %.2f, pushed towards %.2f %.2f", kp.x, kp.y, back.x, back.y);
+    }
     for (size_t k = 0; k < defs.size(); k++) {
         const Def& df = defs[k];
         Bone b; b.part = df.part; b.parent = df.parentBone; b.root = k == 0;
@@ -520,6 +563,7 @@ void DevCommands() {
         typedef void (*dmg_t)(void*, int);
         static dmg_t fDmg = (dmg_t)GetProcAddress(GetModuleHandleA(nullptr), "?DoDamage@CNWSCreature@@UEAAXH@Z");
         Log("dev: kill %08x -> %p", id, sc);
+        if (sc) { void* so = VCall<void* (*)(void*)>(sc, 0x20)(sc); if (so) F<uint32_t>(so, 0x198) = 0x7fffffff; }   // killed by the player
         if (sc && fDmg) fDmg(sc, 1000);
     }
 }

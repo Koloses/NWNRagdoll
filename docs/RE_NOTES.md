@@ -25,3 +25,5 @@
   +0x24 orientation, +0x40 tile data (+8 CNWTileSurfaceMesh*).
 * ?RotateRealToCanonicalTile@CNWTile@@QEAAXMMPEAM0@Z, ?FindTriangle@CNWTileSurfaceMesh@@QEAAHHHMMH@Z
   (mesh, 0 walkable, 0, x, y, -1) -> triangle or -1, ?ComputeHeight@CNWTileSurfaceMesh@@QEAAMVVector@@@Z.
+* Last damager: AsNWSObject (vfunc 0x20) +0x198 (server id, 0x7f000000 none) = NWScript GetLastDamager;
+  ?GetGameObject@CServerExoApp@@QEAAPEAVCGameObject@@I@Z, CNWSObject position +0xa4.
