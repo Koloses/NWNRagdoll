@@ -22,11 +22,17 @@ void* Internal() {
     void* a = App();
     return a ? F<void*>(a, 8) : nullptr;
 }
+// the game object table is torn down and rebuilt while a module loads: lookups then read a null bucket array
+static bool ObjectsReady() {
+    void* in = Internal();
+    void* arr = in ? F<void*>(in, 0x28) : nullptr;
+    return arr && F<void*>(arr, 0) != nullptr && F<uint32_t>(arr, 0x1c) != 0;
+}
 typedef void* (*fn_ptr1)(void*);
 typedef void* (*fn_ptr2u)(void*, uint32_t);
 void* Player() {
     void* in = Internal();
-    if (!in) return nullptr;
+    if (!in || !ObjectsReady()) return nullptr;
     return ((fn_ptr1)A(VA::Internal_GetPlayerCreature))(in);
 }
 void* Module() {
@@ -39,7 +45,7 @@ void* Camera() {
 }
 void* GetObj(uint32_t id) {
     void* a = App();
-    if (!a || id == 0x7f000000) return nullptr;
+    if (!a || id == 0x7f000000 || !ObjectsReady()) return nullptr;
     void* go = ((fn_ptr2u)A(VA::App_GetGameObject))(a, id);
     if (!go) return nullptr;
     return VCall<void* (*)(void*)>(go, OFS::V_AsNWCObject)(go);
