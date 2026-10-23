@@ -73,6 +73,8 @@ enum ObjType : uint8_t { OT_CREATURE = 5, OT_ITEM = 6, OT_TRIGGER = 7, OT_PLACEA
 // ---- accessors ----
 void* App();            // CClientExoApp*
 void* Internal();       // CClientExoAppInternal*
+bool Loading();        // a game / module is loading: object tables are not usable
+void InstallLoadGuard();
 void* Player();         // CNWCCreature* or null
 void* Module();
 void* Camera();

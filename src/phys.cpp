@@ -65,12 +65,12 @@ bool Init() {
 void* ServerApp() { return p_AppManager && *p_AppManager ? F<void*>(*p_AppManager, 8) : nullptr; }
 void* ServerCreature(uint32_t clientId) {
     void* s = ServerApp();
-    if (!s || !fSrvCreature || !F<void*>(s, 8)) return nullptr;
+    if (!s || !fSrvCreature || !F<void*>(s, 8) || G::Loading()) return nullptr;
     return fSrvCreature(s, clientId & 0x7fffffffu);
 }
 void* ServerObject(uint32_t clientId) {
     void* s = ServerApp();
-    if (!s || !fSrvObject || !F<void*>(s, 8)) return nullptr;
+    if (!s || !fSrvObject || !F<void*>(s, 8) || G::Loading()) return nullptr;
     void* g = fSrvObject(s, clientId & 0x7fffffffu);
     return g ? VCall<void* (*)(void*)>(g, 0x20)(g) : nullptr;     // AsNWSObject
 }

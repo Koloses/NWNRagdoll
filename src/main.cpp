@@ -32,6 +32,7 @@ static void Init() {
     if (!G::Init()) { Log("game globals not found"); return; }
     MH_STATUS st = MH_Initialize();
     if (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED) { Log("MinHook init failed"); return; }
+    G::InstallLoadGuard();
     Ragdoll_Install();
 }
 
