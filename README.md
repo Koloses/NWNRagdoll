@@ -19,9 +19,10 @@ It is purely visual on your machine, nothing is sent to a server, and it works n
 
 * **Single player** (and games you host): when the body has come to rest the corpse is moved under
   it, so selecting and looting it happens where you see it.
-* **On someone else's server** the corpse cannot be moved, so the body is kept within
-  `MultiplayerPinRadius` (0.6 m) of where the server has the corpse; items stay close to their
-  real spot the same way, and debris needs the local server.
+* **On someone else's server** everything runs on your side only, the same as in single player; the
+  corpse object itself stays where the server has it (selecting it there), so `MultiplayerPinRadius`
+  can keep the body near it (0 = free). Items stay close to their real spot, and debris needs the
+  local server.
 
 The ground is the area's walkmesh around the body (slopes and steps), and walls and furniture
 are solid, so limbs do not end up in them. Humanoids (players, NPCs, goblins, orcs ...) get a ragdoll
@@ -39,9 +40,9 @@ uninstall. Other game builds are detected and the mod stays off.
 |---|---|---|
 | **[Ragdoll]** Enabled | 1 | |
 | MoveCorpseSinglePlayer | 1 | move the corpse under the body when the server runs on this PC |
-| MultiplayerPinRadius | 0.6 | otherwise, how far the body may end up from the corpse (m) |
+| MultiplayerPinRadius | 0 | otherwise, how far the body may end up from the corpse (m, 0 = no limit) |
 | DeathPush | 2.0 | how hard the body is knocked over, away from the killer (m/s at head height) |
-| DeathAnimationSeconds | 0.35 | death animation before the physics takes over (0 = at once) |
+| DeathAnimationSeconds | 0.24 | death animation before the physics takes over (0 = at once) |
 | MuscleTone | 1.0 | fading muscle tone (0 = limp at once) |
 | DropWeapons | 1 | weapons and shields fall from the hands |
 | MaxSimulationSeconds | 6 | simulation time limit per body |

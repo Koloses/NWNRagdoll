@@ -33,9 +33,9 @@ namespace {
 struct Cfg {
     int enabled = 1;
     int reposition = 1;          // single player: move the corpse object under the body
-    float pinRadius = 0.6f;      // remote server: how far the body may end up from the corpse position
+    float pinRadius = 0;         // remote server: how far the body may end up from the corpse position (0: free)
     float push = 2.0f;           // velocity added away from the killer at death (m/s, at head height)
-    float animLead = 0.35f;       // seconds of the death animation before the physics takes over
+    float animLead = 0.24f;      // seconds of the death animation before the physics takes over
     float muscle = 1.0f;         // strength of the fading muscle tone (0 = limp at once)
     float settleTime = 6.0f;     // seconds of simulation at most
     int maxActive = 10;          // ragdolls simulated at the same time
@@ -639,7 +639,7 @@ void Step(Doll& d, float dt) {
     }
     // against a remote server the corpse stays where it is: keep the body over it
     bool canMove = C.reposition && P::ServerCreature(d.id) != nullptr;
-    if (!canMove && d.bones.size()) {
+    if (!canMove && C.pinRadius > 0 && d.bones.size()) {
         Bone& r = d.bones[0];
         V3 off = r.wp - d.anchor; off.z = 0;
         float l = Len(off);
@@ -895,9 +895,9 @@ float IniFloat(const char* sec, const char* key, float def, const char* ini) {
 void Ragdoll_LoadConfig(const char* ini) {
     C.enabled = IniInt("Ragdoll", "Enabled", 1, ini);
     C.reposition = IniInt("Ragdoll", "MoveCorpseSinglePlayer", 1, ini);
-    C.pinRadius = IniFloat("Ragdoll", "MultiplayerPinRadius", 0.6f, ini);
+    C.pinRadius = IniFloat("Ragdoll", "MultiplayerPinRadius", 0, ini);
     C.push = IniFloat("Ragdoll", "DeathPush", 2.0f, ini);
-    C.animLead = IniFloat("Ragdoll", "DeathAnimationSeconds", 0.35f, ini);
+    C.animLead = IniFloat("Ragdoll", "DeathAnimationSeconds", 0.24f, ini);
     C.muscle = IniFloat("Ragdoll", "MuscleTone", 1.0f, ini);
     C.settleTime = IniFloat("Ragdoll", "MaxSimulationSeconds", 6.0f, ini);
     C.maxActive = IniInt("Ragdoll", "MaxActive", 10, ini);
