@@ -1,5 +1,6 @@
 #include "game.h"
 #include "log.h"
+#include <MinHook.h>
 #include <windows.h>
 #include <cmath>
 
@@ -22,11 +23,47 @@ void* Internal() {
     void* a = App();
     return a ? F<void*>(a, 8) : nullptr;
 }
-// the game object table is torn down and rebuilt while a module loads: lookups then read a null bucket array
+// Loading a game or module tears the object tables down and rebuilds them while the loading screen
+// keeps rendering (and animating): lookups then read freed memory. No lookups while the server loads,
+// nor for a moment after.
+static volatile LONG g_loadDepth = 0;
+static volatile ULONGLONG g_loadEnd = 0;
+typedef int (*LoadFn_t)(void*, void*, void*, void*, void*, void*, void*);
+static LoadFn_t o_LoadGame = nullptr, o_LoadModule = nullptr;     // 5 and 7 register/stack-sized arguments
+static int hk_LoadGame(void* a, void* b, void* c, void* d, void* e, void* f, void* g) {
+    InterlockedIncrement(&g_loadDepth);
+    int r = o_LoadGame(a, b, c, d, e, f, g);
+    g_loadEnd = GetTickCount64(); InterlockedDecrement(&g_loadDepth);
+    return r;
+}
+static int hk_LoadModule(void* a, void* b, void* c, void* d, void* e, void* f, void* g) {
+    InterlockedIncrement(&g_loadDepth);
+    int r = o_LoadModule(a, b, c, d, e, f, g);
+    g_loadEnd = GetTickCount64(); InterlockedDecrement(&g_loadDepth);
+    return r;
+}
+void InstallLoadGuard() {
+    HMODULE exe = GetModuleHandleA(nullptr);
+    void* lg = (void*)GetProcAddress(exe, "?LoadGame@CServerExoAppInternal@@QEAAHIAEAVCExoString@@0PEAVCNWSPlayer@@@Z");
+    void* lm = (void*)GetProcAddress(exe, "?LoadModule@CServerExoAppInternal@@QEAAHVCExoString@@UCUUID@@HPEAVCNWSPlayer@@HAEBUAdvertisement@NWSync@@@Z");
+    if (lg && MH_CreateHook(lg, (void*)hk_LoadGame, (void**)&o_LoadGame) == MH_OK) MH_EnableHook(lg); else o_LoadGame = nullptr;
+    if (lm && MH_CreateHook(lm, (void*)hk_LoadModule, (void**)&o_LoadModule) == MH_OK) MH_EnableHook(lm); else o_LoadModule = nullptr;
+    Log("load guard: %s", o_LoadGame && o_LoadModule ? "ready" : "hooks failed");
+}
+bool Loading() {
+    if (g_loadDepth > 0 || GetTickCount64() - g_loadEnd < 1500) return true;
+    void* s = g_ppAppManager && *g_ppAppManager ? F<void*>(*g_ppAppManager, 8) : nullptr;   // CServerExoApp
+    void* si = s ? F<void*>(s, 8) : nullptr;
+    return si && Readable((char*)si + 0x10140, 4) && F<int>(si, 0x10140) != 0;             // GetLoadingModule
+}
 static bool ObjectsReady() {
+    if (Loading()) return false;
     void* in = Internal();
     void* arr = in ? F<void*>(in, 0x28) : nullptr;
-    return arr && F<void*>(arr, 0) != nullptr && F<uint32_t>(arr, 0x1c) != 0;
+    if (!arr || !Readable(arr, 0x20)) return false;
+    void* buckets = F<void*>(arr, 0);
+    uint32_t n = F<uint32_t>(arr, 0x1c);
+    return buckets && n != 0 && n <= (1u << 22) && Readable(buckets, (size_t)n * 8);
 }
 typedef void* (*fn_ptr1)(void*);
 typedef void* (*fn_ptr2u)(void*, uint32_t);
