@@ -16,6 +16,7 @@
 #include "game.h"
 #include "qmath.h"
 #include "log.h"
+#include "blood.h"
 #include <windows.h>
 #include <MinHook.h>
 #include <box3d/box3d.h>
@@ -42,6 +43,10 @@ struct Cfg {
     float range = 45.0f;         // only creatures this close to the player
     int dropWeapons = 1;         // weapons and shields fall from the hands
     int explosions = 1;          // blasts push bodies
+    int kick = 1;                // walking into a body pushes it
+    float kickSpeed = 2.0f;      // m/s added at the foot
+    int keepCorpses = 1;         // dead creatures stay instead of fading away
+    int maxCorpses = 60;         // kept per area; the oldest fade when there are more
     int debug = 0;
     char devFile[260] = "";      // testing commands
 } C;
@@ -106,6 +111,10 @@ struct Doll {
     b3MeshData* mesh = nullptr;
     bool moved = false;
     uint32_t lastBlast = 0;
+    double lastKick = 0;
+    char blood = 0;              // BLOODCOLR of the creature
+    bool bled = false;
+    float scale = 1;
 };
 std::map<uint32_t, Doll*> g_dolls;          // by creature id
 std::map<void*, Doll*> g_byGob;
@@ -402,11 +411,13 @@ bool StartDoll(void* cre, void* gob, const std::vector<WT>* prevW, float prevDt)
     d.anchor = V3{cp.x, cp.y, cp.z};
     d.ground = cp.z;
     d.muscle = C.muscle;
+    d.blood = Blood_Color(cre);
 
     struct Def { int part; int parentBone; int tip; float radius, cone, twist; JointKind joint; uint64_t cat; };
     std::vector<Def> defs;
     bool humanoid = FindPart(d, "rootdummy") >= 0 && FindPart(d, "torso_g") >= 0 && FindPart(d, "lthigh_g") >= 0;
     float gs = P::GobScale(gob);
+    d.scale = gs;
     if (humanoid) {
         for (const Tmpl& t : HUMANOID) {
             int p = FindPart(d, t.name);
@@ -619,6 +630,22 @@ void Settle(Doll& d) {
     }
 }
 
+// the body is on the ground: a pool spreads under the torso, a few drops land around the head
+void Bleed(Doll& d) {
+    d.bled = true;
+    if (d.blood != 'R') return;
+    V3 torso = d.bones[0].wp, head = torso;
+    for (auto& b : d.bones) {
+        const char* n = P::PartName(d.parts[b.part].part);
+        if (_stricmp(n, "torso_g") == 0) torso = b.wp;
+        if (_stricmp(n, "head_g") == 0) head = b.wp;
+    }
+    Blood_Spill(torso, 0.55f * d.scale, P::Rand(6.0f, 9.0f));
+    int drops = 1 + (int)P::Rand(0, 2.99f);
+    for (int i = 0; i < drops; i++)
+        Blood_Spill(head + V3{P::Rand(-0.4f, 0.4f), P::Rand(-0.4f, 0.4f), 0} * d.scale, P::Rand(0.08f, 0.15f) * d.scale, P::Rand(0.8f, 2.0f));
+}
+
 void Step(Doll& d, float dt) {
     if (d.done || !b3World_IsValid(d.world)) return;
     UpdateMuscles(d);
@@ -652,6 +679,7 @@ void Step(Doll& d, float dt) {
             b3Body_SetLinearVelocity(r.body, BV(v));
         }
     }
+    if (!d.bled && d.t > 0.35 && d.bones.size()) Bleed(d);
     d.calm = maxV < 0.08f ? d.calm + dt : 0;
     if ((d.t > 0.8 && d.calm > 0.5) || d.t > C.settleTime) {
         Settle(d);
@@ -685,7 +713,129 @@ void ApplyBlast(Doll& d, const P::Blast& bl, void* area) {
     }
 }
 
+// something walking through a body: the parts near its feet are kicked along
+bool Jointed(const Doll& d) {
+    for (size_t k = 1; k < d.bones.size(); k++) if (d.bones[k].joint == J_NONE) return false;
+    return true;
+}
+void Kick(Doll& d, V3 from, V3 at, V3 vel, void* area) {
+    double now = P::Now();
+    if (d.bones.empty() || now - d.lastKick < 0.6) return;
+    V3 dir{vel.x, vel.y, 0};
+    float speed = Len(dir);
+    if (speed < 0.01f) return;
+    dir = dir * (1.0f / speed);
+    // closest approach of the walker's path this frame to a part lying on the ground
+    float best = 1e9f;
+    V3 seg = at - from; seg.z = 0;
+    float sl = Dot(seg, seg);
+    for (auto& b : d.bones) {
+        V3 o = b.wp - from;
+        if (o.z > 0.6f || o.z < -0.5f) continue;
+        o.z = 0;
+        float u = sl > 1e-6f ? fminf(fmaxf(Dot(o, seg) / sl, 0.0f), 1.0f) : 1.0f;
+        if (u >= 1.0f && Dot(b.wp - at, dir) < -0.1f) continue;   // already behind the walker
+        V3 c = o - seg * u;
+        float dd = c.x * c.x + c.y * c.y;
+        if (dd < best) { best = dd; }
+    }
+    float r = 0.4f;
+    if (C.debug > 1 && best < 4.0f) Log("ragdoll: %08x walker at %.2f m (%.1f m/s)", d.id, sqrtf(best), speed);
+    if (best > r * r) return;
+    if (d.done && !Jointed(d)) return;                        // model was rebuilt: no skeleton to move
+    d.lastKick = now;
+    float k = C.kickSpeed * fminf(1.6f, 0.6f + speed / 4.0f);
+    auto push = [&](V3 p, float reach) {
+        V3 o = p - at; o.z = 0;
+        float l = Len(o);
+        float f = fmaxf(0.0f, 1.0f - l / reach);
+        V3 side = l > 0.01f ? o * (1.0f / l) : dir;
+        return ((dir * 0.75f + side * 0.25f) * k + V3{0, 0, k * 0.4f}) * f;
+    };
+    if (d.done) {
+        for (auto& b : d.bones) { b.v = push(b.wp, 1.1f * d.scale); b.w = V3{P::Rand(-2, 2), P::Rand(-2, 2), P::Rand(-1, 1)} * Len(b.v) * 0.5f; }
+        for (auto& x : d.drops) { x.v = push(x.wp, 0.8f) * 1.2f; x.w = V3{P::Rand(-6, 6), P::Rand(-6, 6), P::Rand(-6, 6)} * Len(x.v) * 0.3f; }
+        d.muscle = 0;
+        BuildWorld(d, area, false);
+    } else {
+        for (auto& b : d.bones) b3Body_SetLinearVelocity(b.body, BV(VB(b3Body_GetLinearVelocity(b.body)) + push(b.wp, 1.1f * d.scale)));
+        for (auto& x : d.drops) b3Body_SetLinearVelocity(x.body, BV(VB(b3Body_GetLinearVelocity(x.body)) + push(x.wp, 0.8f) * 1.2f));
+    }
+    if (C.debug) Log("ragdoll: %08x kicked at %.1f m/s", d.id, speed);
+}
+
+// ---- corpses stay: the server's "delete this creature" is not carried out for the dead ----
+typedef int (*Msg_t)(void* msg);
+Msg_t o_CreatureDelete = nullptr, fReadBool = nullptr, fReadOverflow = nullptr;
+std::vector<uint32_t> g_kept;               // kept corpses of this area, oldest first
+
+bool KeepCorpse(uint32_t id) {
+    void* o = GetObj(id);
+    void* pl = Player();
+    if (!o || !pl || Type(o) != OT_CREATURE || o == pl) { if (C.debug) Log("ragdoll: %08x obj %p", id, o); return false; }
+    if (F<void*>(o, OFS::Obj_Area) != PlayerArea()) { if (C.debug) Log("ragdoll: %08x not in this area", id); return false; }
+    auto it = g_dead.find(id);
+    bool dead = it != g_dead.end() ? it->second : ClientDead(o);
+    if (!dead) { if (C.debug) Log("ragdoll: %08x not dead", id); return false; }
+    if (P::ServerApp() && P::ServerCreature(id)) {                     // still there: only out of sight
+        if (C.debug) Log("ragdoll: %08x still on the server", id);
+        return false;
+    }
+    return true;
+}
+
+// what the delete message does, for a kept corpse that has to go after all
+void FadeAway(void* o) {
+    typedef void (*i_t)(void*, int); typedef void (*c_t)(void*, char); typedef void (*d_t)(void*, char, int, uint32_t);
+    ((i_t)A(0x140764260))(o, 0);                         // CNWCObject::SetCutsceneInvisible
+    ((c_t)A(0x140764780))(o, 1);                         // SetFadeState
+    ((d_t)A(0x140764420))(o, 0, 1, 3000);                // SetDesiredFadeState
+    VCall<void (*)(void*)>(o, 0x188)(o);
+    F<int>(o, 0x26c) = 0;
+    F<int>(o, 0x104) = 1;                                // deleted once faded
+}
+
+int hk_CreatureDelete(void* msg) {
+    if (C.keepCorpses && C.enabled && fReadBool && fReadOverflow && !Loading()) {
+        uint32_t pos = F<uint32_t>(msg, 0x44), size = F<uint32_t>(msg, 0x40);
+        const char* buf = F<const char*>(msg, 0x38);
+        if (buf && (uint64_t)pos + 4 <= size) {
+            uint32_t id = *(const uint32_t*)(buf + pos);
+            if (C.debug) Log("ragdoll: server deletes %08x", id);
+            if (KeepCorpse(id)) {
+                F<uint32_t>(msg, 0x44) = pos + 4;        // ReadOBJECTIDClient
+                fReadBool(msg);                          // instant or faded
+                if (fReadOverflow(msg)) return 0;
+                void* o = GetObj(id);
+                F<int>(o, OFS::Obj_Selectable) = 0;
+                g_kept.push_back(id);
+                Log("ragdoll: %08x corpse kept (%d in the area)", id, (int)g_kept.size());
+                while ((int)g_kept.size() > C.maxCorpses) {
+                    void* old = GetObj(g_kept.front());
+                    if (old) FadeAway(old);
+                    g_kept.erase(g_kept.begin());
+                }
+                return 1;
+            }
+        }
+    }
+    return o_CreatureDelete(msg);
+}
+
+struct DevWalk { V3 a, b; double t0 = 0, secs = 0; } g_walk;
+void DevWalkStep() {
+    if (g_walk.secs <= 0) return;
+    void* pl = Player();
+    if (!pl) { g_walk.secs = 0; return; }
+    float u = (float)((P::Now() - g_walk.t0) / g_walk.secs);
+    if (u > 1) { u = 1; g_walk.secs = 0; }
+    V3 p = g_walk.a + (g_walk.b - g_walk.a) * u;
+    P::SetServerPosition(Id(pl), p);
+    F<Vec3>(pl, OFS::Obj_Pos) = Vec3{p.x, p.y, p.z};
+}
+
 void DevCommands() {
+    DevWalkStep();
     if (!C.devFile[0]) return;
     FILE* f = fopen(C.devFile, "r");
     if (!f) return;
@@ -699,6 +849,16 @@ void DevCommands() {
         if (in && sscanf(line + 4, "%f %f %f", &z, &p, &y) == 3) {
             Log("dev: cam was %.2f %.2f %.2f", F<float>(in, OFS::In_CamZoom), F<float>(in, OFS::In_CamPitch), F<float>(in, OFS::In_CamYaw));
             F<float>(in, OFS::In_CamZoom) += z; F<float>(in, OFS::In_CamPitch) += p; F<float>(in, OFS::In_CamYaw) += y;
+        }
+        return;
+    }
+    if (strncmp(line, "walk ", 5) == 0) {     // walk <x0> <y0> <x1> <y1> <seconds>: move the player in a straight line
+        float s = 1;
+        if (sscanf(line + 5, "%f %f %f %f %f", &g_walk.a.x, &g_walk.a.y, &g_walk.b.x, &g_walk.b.y, &s) == 5) {
+            void* pl = Player();
+            g_walk.a.z = g_walk.b.z = pl ? Pos(pl).z : 0;
+            g_walk.t0 = P::Now(); g_walk.secs = s;
+            Log("dev: walk %.1f %.1f -> %.1f %.1f in %.1f s", g_walk.a.x, g_walk.a.y, g_walk.b.x, g_walk.b.y, s);
         }
         return;
     }
@@ -736,6 +896,19 @@ void DevCommands() {
         if (fac) ((am_t)A(0x1404ab900))(fac, id & 0x7fffffffu, 1);
         return;
     }
+    if (strncmp(line, "destroy ", 8) == 0) {  // destroy <id>: the server removes the object (as DestroyObject)
+        uint32_t id = (uint32_t)strtoul(line + 8, nullptr, 16) & 0x7fffffffu;
+        HMODULE exe = GetModuleHandleA(nullptr);
+        typedef void* (*gm_t)(void*);
+        typedef int (*ev_t)(void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+        gm_t gm = (gm_t)GetProcAddress(exe, "?GetServerAIMaster@CServerExoApp@@QEAAPEAVCServerAIMaster@@XZ");
+        ev_t ev = (ev_t)GetProcAddress(exe, "?AddEventDeltaTime@CServerAIMaster@@QEAAHIIIIIPEAX@Z");
+        void* srv = P::ServerApp();
+        void* ai = srv && gm ? gm(srv) : nullptr;
+        Log("dev: destroy %08x", id);
+        if (ai && ev) ev(ai, 0, 0, id, id, F<uint32_t>((void*)A(0x140df9db4), 0), nullptr);
+        return;
+    }
     if (strncmp(line, "kill ", 5) == 0) {
         uint32_t id = (uint32_t)strtoul(line + 5, nullptr, 16);
         void* sc = P::ServerCreature(id);
@@ -764,7 +937,10 @@ void Update() {
     void* pl = Player();
     void* area = PlayerArea();
     static void* lastArea = nullptr;
-    if (area != lastArea) { lastArea = area; g_dead.clear(); g_pending.clear(); }
+    static std::map<uint32_t, V3> lastPos;
+    if (area != lastArea) { lastArea = area; g_dead.clear(); g_pending.clear(); g_kept.clear(); lastPos.clear(); }
+    struct Mover { V3 p0, p, v; };
+    std::vector<Mover> movers;
     for (auto it = g_dolls.begin(); it != g_dolls.end();) {
         Doll* d = it->second; ++it;
         void* c = GetObj(d->id);
@@ -779,7 +955,7 @@ void Update() {
     // pending deaths whose model went away
     for (auto it = g_pending.begin(); it != g_pending.end();) {
         void* c = GetObj(it->second.id);
-        if (!c || CreatureGob(c) != it->first || now - it->second.t0 > 3.0) it = g_pending.erase(it); else ++it;
+        if (!c || CreatureGob(c) != it->first || now - it->second.t0 > 5.0) it = g_pending.erase(it); else ++it;
     }
     if (!pl || !area) { g_dead.clear(); return; }
     int n = F<int>(area, OFS::Area_ObjCount);
@@ -797,6 +973,17 @@ void Update() {
         bool known = it != g_dead.end();
         bool was = known && it->second;
         g_dead[id] = dead;
+        if (!dead && C.kick && !g_dolls.empty()) {
+            Vec3 p = Pos(o);
+            V3 cur{p.x, p.y, p.z};
+            auto lp = lastPos.find(id);
+            if (lp != lastPos.end() && dt > 0.001) {
+                V3 v = (cur - lp->second) * (float)(1.0 / dt);
+                float s = sqrtf(v.x * v.x + v.y * v.y);
+                if (s > 0.6f && s < 15.0f) movers.push_back({lp->second, cur, v});
+            }
+            lastPos[id] = cur;
+        }
         if (dead && known && !was && C.enabled) {
             Vec3 p = Pos(o);
             float dx = p.x - pp.x, dy = p.y - pp.y;
@@ -812,6 +999,9 @@ void Update() {
             for (auto pit = g_pending.begin(); pit != g_pending.end(); ++pit) if (pit->second.id == id) { g_pending.erase(pit); break; }
         }
     }
+    // walking through bodies
+    for (auto& m : movers)
+        for (auto& kv : g_dolls) Kick(*kv.second, m.p0, m.p, m.v, area);
     // blasts
     for (auto& bl : P::Blasts()) {
         if (now - bl.t > 0.5) continue;
@@ -828,6 +1018,7 @@ void Update() {
     }
     if (steps == 4) g_acc = 0;
     Props_Update(area);
+    Blood_Update(area);
 }
 
 void hk_SceneAnimate(void* scene, float dt) {
@@ -904,12 +1095,18 @@ void Ragdoll_LoadConfig(const char* ini) {
     C.range = IniFloat("Ragdoll", "Range", 45.0f, ini);
     C.dropWeapons = IniInt("Ragdoll", "DropWeapons", 1, ini);
     C.explosions = IniInt("Physics", "Explosions", 1, ini);
+    C.kick = IniInt("Ragdoll", "KickBodies", 1, ini);
+    C.kickSpeed = IniFloat("Ragdoll", "KickStrength", 2.0f, ini);
+    C.keepCorpses = IniInt("Ragdoll", "KeepCorpses", 1, ini);
+    C.maxCorpses = IniInt("Ragdoll", "MaxCorpses", 60, ini);
     C.debug = IniInt("Ragdoll", "Debug", 0, ini);
     GetPrivateProfileStringA("Developer", "CommandFile", "", C.devFile, sizeof C.devFile, ini);
     Log("config: enabled %d moveCorpse %d pin %.2f push %.2f lead %.2f muscle %.2f maxTime %.1f maxActive %d range %.0f drop %d blasts %d",
         C.enabled, C.reposition, C.pinRadius, C.push, C.animLead, C.muscle, C.settleTime, C.maxActive, C.range, C.dropWeapons, C.explosions);
+    Log("config: kick %d (%.1f) keep corpses %d (max %d)", C.kick, C.kickSpeed, C.keepCorpses, C.maxCorpses);
     Props_LoadConfig(ini);
     Cloth_LoadConfig(ini);
+    Blood_LoadConfig(ini);
 }
 
 void Ragdoll_Install() {
@@ -926,6 +1123,13 @@ void Ragdoll_Install() {
     }
     if (ac && MH_CreateHook(ac, (void*)hk_AttachControl, (void**)&o_AttachControl) == MH_OK && MH_EnableHook(ac) == MH_OK) Log("attach hook ready");
     else { Log("attach hook failed - weapons stay in the hands"); C.dropWeapons = 0; }
+    fReadBool = (Msg_t)GetProcAddress(exe, "?ReadBOOL@CNWMessage@@QEAAHXZ");
+    fReadOverflow = (Msg_t)GetProcAddress(exe, "?MessageReadOverflow@CNWMessage@@QEAAHXZ");
+    void* cd = (void*)A(0x140780210);                    // CNWCMessage::HandleServerToPlayerCreatureUpdate_Delete
+    if (fReadBool && fReadOverflow && MH_CreateHook(cd, (void*)hk_CreatureDelete, (void**)&o_CreatureDelete) == MH_OK && MH_EnableHook(cd) == MH_OK)
+        Log("corpse hook ready");
+    else { Log("corpse hook failed - corpses fade as usual"); C.keepCorpses = 0; }
+    Blood_Install();
     P::InstallBlastHook();
     Props_Install();
     Cloth_Install();
