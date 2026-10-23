@@ -7,6 +7,11 @@ Physics for **Neverwinter Nights: Enhanced Edition** (Windows, build 8193.37):
   goes limp over a second and comes to rest on the ground the way it landed. Knees and elbows only
   bend the right way and limbs do not pass through each other.
 * **Weapons and shields** fall from the hands and land next to the body.
+* **Bodies stay.** The dead no longer fade away when the server removes them; they lie where they
+  fell until you leave the area (`MaxCorpses` per area, the oldest fade beyond that).
+* **Kicking bodies.** Walking through a body (you or anyone else) kicks it along.
+* **Blood.** A pool of blood spreads under red-blooded bodies as they hit the ground, with a few
+  drops around the head, and stays until you leave the area.
 * **Cloth.** Cloaks, tabards, belt flaps and loincloths swing with the body's motion, on everyone
   near you, alive or dead.
 * **Explosions** (fireball, meteor swarm, ice storm, gas / electric / mystical explosions, implosion
@@ -47,6 +52,13 @@ uninstall. Other game builds are detected and the mod stays off.
 | MaxSimulationSeconds | 6 | simulation time limit per body |
 | MaxActive | 10 | bodies simulated at the same time |
 | Range | 45 | only deaths this close to you (m) |
+| KickBodies | 1 | walking through a body kicks it |
+| KickStrength | 2.0 | how hard (m/s) |
+| KeepCorpses | 1 | the dead stay instead of fading away |
+| MaxCorpses | 60 | kept bodies per area |
+| **[Blood]** Enabled | 1 | blood pools under the dead |
+| PoolSize | 1.0 | size of a full pool |
+| MaxPools | 48 | pools per area (the oldest are reused) |
 | **[Physics]** Explosions | 1 | blasts throw bodies, weapons and debris |
 | Debris | 1 | bashed placeables break into pieces (single player) |
 | DebrisSeconds | 20 | how long pieces stay |
@@ -60,7 +72,10 @@ exported `Scene::Animate` (once per frame: watch deaths, step the simulations at
 `Gob::Animate` (right after the engine animates a creature model: freeze the pose from the moment of
 death and set the bone rotations from the rigid bodies; cloth chains are simulated there too),
 `CAurBehaviorAttach::Control` (weapons that left the hand stay where they lie) and
-`CNWCVisualEffect::LoadEffect` (fire-and-forget effects with a blast). Death is read from the in-process server in
+`CNWCVisualEffect::LoadEffect` (fire-and-forget effects with a blast) and
+`CNWCMessage::HandleServerToPlayerCreatureUpdate_Delete` (a dead creature's delete is read and
+dropped, so the client keeps the body; it is cleared with the area). Blood pools are the game's
+`dag_floorblood1..6` models, scaled up over a few seconds. Death is read from the in-process server in
 single player (`CNWSObject::GetDead`) and from the client's damage level otherwise. The killer is the
 server's last damager (CNWSObject+0x198) in single player; online the closest creature of the other side. See
 `docs/RE_NOTES.md`.
