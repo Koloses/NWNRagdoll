@@ -5,6 +5,7 @@
 #include <cmath>
 
 namespace G {
+static volatile uint32_t g_frame;   // bumped by NewFrame(); per-frame caches compare against it
 uintptr_t base = 0;
 static void** g_ppAppManager = nullptr;   // CAppManager** (address of the exported global)
 
@@ -56,7 +57,7 @@ bool Loading() {
     void* si = s ? F<void*>(s, 8) : nullptr;
     return si && Readable((char*)si + 0x10140, 4) && F<int>(si, 0x10140) != 0;             // GetLoadingModule
 }
-static bool ObjectsReady() {
+static bool ObjectsReadyNow() {
     if (Loading()) return false;
     void* in = Internal();
     void* arr = in ? F<void*>(in, 0x28) : nullptr;
@@ -64,6 +65,15 @@ static bool ObjectsReady() {
     void* buckets = F<void*>(arr, 0);
     uint32_t n = F<uint32_t>(arr, 0x1c);
     return buckets && n != 0 && n <= (1u << 22) && Readable(buckets, (size_t)n * 8);
+}
+// checked once per frame (per thread), not on every GetObj()
+static bool ObjectsReady() {
+    thread_local uint32_t stamp = ~0u;
+    thread_local uint64_t tick;
+    thread_local bool ready;
+    uint64_t now = GetTickCount64();
+    if (stamp != g_frame || now - tick > 100) { stamp = g_frame; tick = now; ready = ObjectsReadyNow(); }
+    return ready;
 }
 typedef void* (*fn_ptr1)(void*);
 typedef void* (*fn_ptr2u)(void*, uint32_t);
@@ -136,15 +146,37 @@ static bool InImage(uintptr_t p) {
     }
     return p >= lo && p < hi;
 }
+// Readable() is called for nearly every object pointer the mod touches, thousands of times a frame in big
+// areas, and VirtualQuery is a system call. So the regions it reports are cached until the next frame
+// (NewFrame, called at the start of the per-frame update) or for at most 100 ms.
+namespace {
+struct Region { uintptr_t lo, hi; bool ok; };
+thread_local Region t_reg[32];
+thread_local int t_nreg, t_next;
+thread_local uint32_t t_stamp;
+thread_local uint64_t t_tick;
+void FreshCache() {
+    uint64_t now = GetTickCount64();
+    if (t_stamp != g_frame || now - t_tick > 100) { t_stamp = g_frame; t_tick = now; t_nreg = 0; t_next = 0; }
+}
+}
+void NewFrame() { g_frame = g_frame + 1; }
 bool Readable(const void* p, size_t n) {
     if (!p || (uintptr_t)p < 0x10000) return false;
+    uintptr_t a = (uintptr_t)p, e = a + n;
+    if (e < a) return false;
+    FreshCache();
+    for (int i = 0; i < t_nreg; i++)
+        if (a >= t_reg[i].lo && a < t_reg[i].hi) return t_reg[i].ok && e <= t_reg[i].hi;
     MEMORY_BASIC_INFORMATION mbi;
     if (!VirtualQuery(p, &mbi, sizeof mbi)) return false;
-    if (mbi.State != MEM_COMMIT) return false;
     DWORD pr = mbi.Protect & 0xff;
-    if (!(pr & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))) return false;
-    if (mbi.Protect & PAGE_GUARD) return false;
-    return (uintptr_t)p + n <= (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+    bool ok = mbi.State == MEM_COMMIT && !(mbi.Protect & PAGE_GUARD) &&
+        (pr & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
+    Region r = {(uintptr_t)mbi.BaseAddress, (uintptr_t)mbi.BaseAddress + mbi.RegionSize, ok};
+    if (t_nreg < 32) t_reg[t_nreg++] = r;
+    else { t_reg[t_next] = r; t_next = (t_next + 1) & 31; }
+    return ok && e <= r.hi;
 }
 const char* ClassName(void* obj) {
     static char buf[128];

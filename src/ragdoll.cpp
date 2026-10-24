@@ -1022,6 +1022,7 @@ void Update() {
 }
 
 void hk_SceneAnimate(void* scene, float dt) {
+    G::NewFrame();
     Update();
     o_SceneAnimate(scene, dt);
 }
