@@ -87,7 +87,8 @@ inline uint8_t Type(void* o) { return F<uint8_t>(o, OFS::Obj_Type); }
 // ---- original function pointers / wrappers ----
 int  HandleInputEvent(int id, int value);
 const char* ClassName(void* obj);
-bool Readable(const void* p, size_t n);
+bool Readable(const void* p, size_t n);   // cached per frame, see NewFrame
+void NewFrame();                          // call once at the start of each frame's update
 int  DefaultAction(void* obj);
 float CameraYaw();
 bool WorldToScreen(const Vec3& w, float& sx, float& sy); // normalized 0..1, y down
