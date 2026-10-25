@@ -10,8 +10,9 @@ Physics for **Neverwinter Nights: Enhanced Edition** (Windows, build 8193.37):
 * **Bodies stay.** The dead no longer fade away when the server removes them; they lie where they
   fell until you leave the area (`MaxCorpses` per area, the oldest fade beyond that).
 * **Kicking bodies.** Walking through a body (you or anyone else) kicks it along.
-* **Blood.** A pool of blood spreads under red-blooded bodies as they hit the ground, with a few
-  drops around the head, and stays until you leave the area.
+* **Blood.** A pool of blood spreads under bleeding bodies as they hit the ground, with a few
+  drops around the head, and stays until you leave the area: red, green (zombies, ...) or yellow,
+  by the creature's blood colour.
 * **Cloth.** Cloaks, tabards, belt flaps and loincloths swing with the body's motion, on everyone
   near you, alive or dead.
 * **Explosions** (fireball, meteor swarm, ice storm, gas / electric / mystical explosions, implosion
@@ -36,8 +37,9 @@ with proper joint limits, other creatures one built from their skeleton.
 ## Install
 
 Copy `dbghelp.dll` and `NWNRagdoll.ini` into `Neverwinter Nights - Enhanced Edition\bin\win32`
-(next to `nwmain.exe`). A log is written to `bin\win32\NWNRagdoll.log`. Delete the two files to
-uninstall. Other game builds are detected and the mod stays off.
+(next to `nwmain.exe`), and the files in `ovr` (green and yellow blood pools, `dag_floorbldgr*` /
+`dag_floorbldye*`) into the game's user override folder, `Documents\Neverwinter Nights\override`. A log is written to
+`bin\win32\NWNRagdoll.log`. Delete those files to uninstall. Other game builds are detected and the mod stays off.
 
 ## Settings (`NWNRagdoll.ini`)
 

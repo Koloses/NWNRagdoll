@@ -27,6 +27,7 @@ release: build/dbghelp.dll
 	rm -rf build/release && mkdir -p build/release
 	cp build/dbghelp.dll NWNRagdoll.ini README.md build/release/
 	cp third_party/box3d/LICENSE build/release/LICENSE-box3d.txt
-	cd build/release && zip -q -9 ../NWNRagdoll.zip *
+	mkdir -p build/release/ovr && cp ovr/* build/release/ovr/
+	cd build/release && zip -q -9 -r ../NWNRagdoll.zip *
 clean:
 	rm -rf build

@@ -633,17 +633,19 @@ void Settle(Doll& d) {
 // the body is on the ground: a pool spreads under the torso, a few drops land around the head
 void Bleed(Doll& d) {
     d.bled = true;
-    if (d.blood != 'R') return;
+    if (!Blood_Bleeds(d.blood)) return;
     V3 torso = d.bones[0].wp, head = torso;
+    float floor = d.ground;                       // where the walkmesh can't be found: not above the body's lowest point
+    for (auto& b : d.bones) floor = fminf(floor, b.wp.z - b.radius);
     for (auto& b : d.bones) {
         const char* n = P::PartName(d.parts[b.part].part);
         if (_stricmp(n, "torso_g") == 0) torso = b.wp;
         if (_stricmp(n, "head_g") == 0) head = b.wp;
     }
-    Blood_Spill(torso, 0.55f * d.scale, P::Rand(6.0f, 9.0f));
+    Blood_Spill(torso, 0.55f * d.scale, P::Rand(6.0f, 9.0f), d.blood, floor);
     int drops = 1 + (int)P::Rand(0, 2.99f);
     for (int i = 0; i < drops; i++)
-        Blood_Spill(head + V3{P::Rand(-0.4f, 0.4f), P::Rand(-0.4f, 0.4f), 0} * d.scale, P::Rand(0.08f, 0.15f) * d.scale, P::Rand(0.8f, 2.0f));
+        Blood_Spill(head + V3{P::Rand(-0.4f, 0.4f), P::Rand(-0.4f, 0.4f), 0} * d.scale, P::Rand(0.08f, 0.15f) * d.scale, P::Rand(0.8f, 2.0f), d.blood, floor);
 }
 
 void Step(Doll& d, float dt) {
