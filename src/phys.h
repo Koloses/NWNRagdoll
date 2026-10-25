@@ -27,6 +27,7 @@ float GobScale(void* gob);
 void SetGobTransform(void* gob, V3 p, Q4 q);     // Gob::SetPosition / SetOrientation
 // mesh extent of a gob (and the gobs attached to it) in the gob's own frame
 bool GobExtent(void* gob, V3& mn, V3& mx);
+void* MdlTriMesh(void* part);                    // the part's mesh (bounds at +0xc0 / +0xcc, part frame) or null
 
 // ---- ground: the area's walkmesh ----
 bool GroundAt(void* area, float x, float y, float& h);
