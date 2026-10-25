@@ -72,7 +72,7 @@ bool ClientDead(void* cre) {
 // ---- model snapshot ----
 struct PartRec { void* part; int parent; V3 lp; Q4 lq; float s; int bone = -1; };
 enum JointKind { J_NONE, J_BALL, J_HINGE };
-enum : uint64_t { CAT_GROUND = 1, CAT_CORE = 2, CAT_ARM = 4, CAT_LEG = 8, CAT_DROP = 16 };
+enum : uint64_t { CAT_GROUND = 1, CAT_CORE = 2, CAT_ARM = 4, CAT_LEG = 8, CAT_DROP = 16, CAT_LIMB = 32 };
 struct Bone {
     int part;                    // index into parts
     int parent = -1;             // parent bone
@@ -209,6 +209,9 @@ uint64_t MaskOf(uint64_t cat) {
     case CAT_ARM: return CAT_GROUND | CAT_CORE | CAT_ARM | CAT_LEG;
     case CAT_LEG: return CAT_GROUND | CAT_ARM | CAT_LEG;
     case CAT_DROP: return CAT_GROUND;
+    // limbs of a generic skeleton (beetles, spiders ...) start packed together: touching each other they push
+    // apart hard enough to throw the body away, so they only meet the ground
+    case CAT_LIMB: return CAT_GROUND;
     }
     return CAT_GROUND;
 }
@@ -279,7 +282,7 @@ void BuildWorld(Doll& d, void* area, bool springs) {
         sd.filter.maskBits = MaskOf(b.cat);
         sd.baseMaterial.friction = b.cat == CAT_LEG ? 0.5f : 0.8f;
         sd.baseMaterial.rollingResistance = 0.05f;
-        sd.density = 1000.0f;
+        sd.density = b.cat == CAT_LIMB ? 400.0f : 1000.0f;
         if (b.capsule) { b3Capsule cap{BV(b.a), BV(b.b), b.radius}; b3CreateCapsuleShape(b.body, &sd, &cap); }
         else { b3Sphere sp{b3Vec3{0, 0, 0}, b.radius}; b3CreateSphereShape(b.body, &sd, &sp); }
     }
@@ -458,7 +461,7 @@ bool StartDoll(void* cre, void* gob, const std::vector<WT>* prevW, float prevDt)
             if (defs.size() >= 24) break;
             boneOf[i] = (int)defs.size();
             // generic skeletons: limbs collide with each other but not with the body they hang from
-            defs.push_back({(int)i, pb, -1, 0.05f * gs, 0.8f, 0.5f, J_BALL, pb == 0 ? CAT_LEG : CAT_ARM});
+            defs.push_back({(int)i, pb, -1, 0.05f * gs, 0.8f, 0.5f, J_BALL, CAT_LIMB});
         }
         for (size_t k = 0; k < defs.size(); k++)
             for (size_t j = k + 1; j < defs.size(); j++)
@@ -516,6 +519,24 @@ bool StartDoll(void* cre, void* gob, const std::vector<WT>* prevW, float prevDt)
             float r = fminf(df.radius, len * 0.45f);
             b.radius = r; b.a = dir * r; b.b = tipLocal - dir * r;
         }
+        // generic skeletons: the part's own mesh gives the shape (a beetle's body is one wide mesh, not a
+        // stick to the next part); a body much lighter than its legs makes the joints throw it around
+        if (!humanoid) {
+            void* m = P::MdlTriMesh(d.parts[df.part].part);
+            V3 mn = m ? F<V3>(m, 0xc0) : V3{}, mx = m ? F<V3>(m, 0xcc) : V3{};
+            float sc = w[df.part].s > 0.001f ? w[df.part].s : gs;
+            V3 ext = (mx - mn) * sc;
+            if (m && ext.x > 0.02f && ext.y > 0.02f && ext.z > 0.0f && Len(ext) < 6.0f) {
+                V3 c = (mn + mx) * (0.5f * sc);
+                float e[3] = {ext.x, ext.y, ext.z};
+                int ax = e[0] >= e[1] && e[0] >= e[2] ? 0 : e[1] >= e[2] ? 1 : 2;
+                float other = fmaxf(e[(ax + 1) % 3], e[(ax + 2) % 3]);
+                float r = fmaxf(0.03f, fminf(0.5f * other * 0.8f, 0.5f * e[ax]));
+                float half = fmaxf(0.0f, 0.5f * e[ax] - r);
+                V3 dir{ax == 0 ? 1.0f : 0, ax == 1 ? 1.0f : 0, ax == 2 ? 1.0f : 0};
+                b.capsule = true; b.radius = r; b.a = c - dir * half; b.b = c + dir * half;
+            }
+        }
         // joint frames at this bone's origin
         if (df.parentBone >= 0) {
             Bone& pb = d.bones[df.parentBone];
@@ -552,6 +573,11 @@ bool StartDoll(void* cre, void* gob, const std::vector<WT>* prevW, float prevDt)
     for (size_t k = 0; k < d.bones.size(); k++) d.parts[d.bones[k].part].bone = (int)k;
     CollectDrops(d, away * C.push);
     BuildWorld(d, F<void*>(cre, OFS::Obj_Area), d.muscle > 0);
+    if (C.debug > 1) for (size_t k = 0; k < d.bones.size(); k++) {
+        const Bone& b = d.bones[k];
+        Log("ragdoll:   bone %d %-24s parent %d at %.2f %.2f %.2f v %.2f %.2f %.2f w %.1f r %.3f len %.3f joint %d", (int)k, P::PartName(d.parts[b.part].part), b.parent,
+            b.wp.x, b.wp.y, b.wp.z, b.v.x, b.v.y, b.v.z, Len(b.w), b.radius, b.capsule ? Len(b.b - b.a) : 0.0f, (int)b.joint);
+    }
     g_dolls[d.id] = dp;
     g_byGob[gob] = dp;
     for (auto& x : dp->drops) g_dropByGob[x.gob] = &x;
@@ -653,6 +679,12 @@ void Step(Doll& d, float dt) {
     UpdateMuscles(d);
     b3World_Step(d.world, dt, 4);
     d.t += dt;
+    // a body never moves like this on its own: a bad contact or joint would fling it off
+    for (auto& b : d.bones) {
+        V3 lv = VB(b3Body_GetLinearVelocity(b.body)), av = VB(b3Body_GetAngularVelocity(b.body));
+        if (Len(lv) > 12.0f) b3Body_SetLinearVelocity(b.body, BV(ClampLen(lv, 12.0f)));
+        if (Len(av) > 30.0f) b3Body_SetAngularVelocity(b.body, BV(ClampLen(av, 30.0f)));
+    }
     float maxV = 0;
     for (auto& b : d.bones) {
         b3WorldTransform tf = b3Body_GetTransform(b.body);
