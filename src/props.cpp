@@ -362,6 +362,9 @@ void Props_AfterAnimate(void* gob) {
 
 void Props_Blast(const P::Blast& bl) {
     if (!g_area) return;
+    static uint32_t done = 0;                    // each blast once (the caller sees it for half a second)
+    if (bl.serial <= done) return;
+    done = bl.serial;
     // items on the ground near the blast, simulated before or not
     int n = F<int>(g_area, OFS::Area_ObjCount);
     uint32_t* ids = F<uint32_t*>(g_area, OFS::Area_ObjIds);
