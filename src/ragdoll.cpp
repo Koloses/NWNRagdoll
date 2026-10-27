@@ -1060,13 +1060,36 @@ void Update() {
     Blood_Update(area);
 }
 
+// time spent in our code per frame: frames over 8 ms and long gaps are logged
+double g_tUpdate = 0, g_tGob = 0;
+double Ms() { LARGE_INTEGER f, t; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t); return t.QuadPart * 1000.0 / f.QuadPart; }
+void ProfFrame() {
+    static double last = 0;
+    double now = Ms();
+    static int n = 0;
+    if (last > 0 && now - last > 400.0 && n < 300) { n++; Log("prof: FREEZE %.0f ms between frames (ragdoll in it: update %.1f, models %.1f ms, %d dolls)", now - last, g_tUpdate, g_tGob, (int)g_dolls.size()); }
+    else if (g_tUpdate + g_tGob > 8.0 && n < 300) { n++; Log("prof: frame spent %.1f ms in NWNRagdoll (update %.1f, models %.1f, %d dolls)", g_tUpdate + g_tGob, g_tUpdate, g_tGob, (int)g_dolls.size()); }
+    last = now;
+    g_tUpdate = g_tGob = 0;
+}
+
 void hk_SceneAnimate(void* scene, float dt) {
+    double t0 = Ms();
+    double gap = P::Now() - g_lastUpdate;
+    if (gap >= 0.002) ProfFrame();               // a new frame (the same check Update makes)
     Update();                                    // (once per frame; it starts the frame's memory-check cache)
+    g_tUpdate += Ms() - t0;
     o_SceneAnimate(scene, dt);
 }
 
+static void GobAfter(void* gob);
 void hk_GobAnimate(void* gob, float dt) {
     o_GobAnimate(gob, dt);
+    double t0 = Ms();
+    GobAfter(gob);
+    g_tGob += Ms() - t0;
+}
+static void GobAfter(void* gob) {
     auto pit = g_pending.find(gob);
     if (pit != g_pending.end()) {
         // death animation still playing: remember this pose, start the ragdoll when the lead time is over
