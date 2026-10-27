@@ -6,6 +6,7 @@
 #include <MinHook.h>
 #include <cstring>
 #include <cmath>
+#include <unordered_map>
 #include <map>
 
 using namespace G;
@@ -164,14 +165,38 @@ bool GroundAt(void* area, float x, float y, float& h) {
     return true;
 }
 
+// walkmesh heights on a lattice of the area, kept until the area changes: bodies that start again (kicked,
+// thrown by a blast) and bodies near each other sample the same points
+namespace {
+void* g_latArea = nullptr;
+float g_latCell = 0;
+std::unordered_map<uint64_t, float> g_lattice;          // (i, j) -> height, NAN = no walkmesh
+bool LatticeGround(void* area, int i, int j, float cell, float& h) {
+    if (area != g_latArea || cell != g_latCell) { g_lattice.clear(); g_latArea = area; g_latCell = cell; }
+    uint64_t k = ((uint64_t)(uint32_t)i << 32) | (uint32_t)j;
+    auto it = g_lattice.find(k);
+    if (it == g_lattice.end()) {
+        float v = 0;
+        if (!GroundAt(area, i * cell, j * cell, v)) v = NAN;
+        if (g_lattice.size() > 400000) g_lattice.clear();
+        it = g_lattice.emplace(k, v).first;
+    }
+    if (std::isnan(it->second)) return false;
+    h = it->second;
+    return true;
+}
+}  // namespace
+
 b3MeshData* AddGround(b3WorldId world, void* area, V3 center, float refZ, int N, float cell) {
     std::vector<b3Vec3> v(N * N);
     std::vector<char> walk(N * N, 0);
-    float x0 = center.x - cell * (N - 1) * 0.5f, y0 = center.y - cell * (N - 1) * 0.5f;
+    // the grid sits on the lattice (cell multiples) nearest to centring it on 'center'
+    int i0 = (int)lroundf((center.x - cell * (N - 1) * 0.5f) / cell), j0 = (int)lroundf((center.y - cell * (N - 1) * 0.5f) / cell);
+    float x0 = i0 * cell, y0 = j0 * cell;
     int walkable = 0;
     for (int j = 0; j < N; j++) for (int i = 0; i < N; i++) {
         float h = refZ;
-        bool ok = GroundAt(area, x0 + i * cell, y0 + j * cell, h);
+        bool ok = LatticeGround(area, i0 + i, j0 + j, cell, h);
         if (ok && fabsf(h - refZ) > 3.0f) ok = false;   // another floor
         walk[j * N + i] = ok; walkable += ok;
         v[j * N + i] = b3Vec3{x0 + i * cell, y0 + j * cell, ok ? h : refZ};

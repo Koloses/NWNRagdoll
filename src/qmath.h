@@ -9,6 +9,7 @@ inline V3 operator+(V3 a, V3 b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
 inline V3 operator-(V3 a, V3 b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
 inline V3 operator*(V3 a, float s) { return {a.x * s, a.y * s, a.z * s}; }
 inline float Dot(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+inline float Dot4(Q4 a, Q4 b) { return a.w * b.w + a.x * b.x + a.y * b.y + a.z * b.z; }
 inline V3 Cross(V3 a, V3 b) { return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x}; }
 inline float Len(V3 a) { return sqrtf(Dot(a, a)); }
 

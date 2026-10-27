@@ -266,6 +266,9 @@ void Props_Step(float dt) {
 
 void Props_Blast(const P::Blast& bl) {
     if (!g_area) return;
+    static uint32_t done = 0;                    // each blast once (the caller sees it for half a second)
+    if (bl.serial <= done) return;
+    done = bl.serial;
     for (auto& c : g_pool) {
         if (!c.inUse) continue;
         V3 v = P::BlastVelocity(bl, c.b.wp);

@@ -113,6 +113,8 @@ struct Doll {
     uint32_t lastBlast = 0;
     double lastKick = 0;
     char blood = 0;              // BLOODCOLR of the creature
+    // a settled body's pose: the bone parts' locals as computed for this root placement (reused every frame)
+    struct Pose { bool valid = false; V3 rp; Q4 rq; std::vector<V3> lp; std::vector<Q4> lq; } pose;
     bool bled = false;
     float scale = 1;
 };
@@ -755,6 +757,7 @@ bool Jointed(const Doll& d) {
 void Kick(Doll& d, V3 from, V3 at, V3 vel, void* area) {
     double now = P::Now();
     if (d.bones.empty() || now - d.lastKick < 0.6) return;
+    { V3 o = d.bones[0].wp - at; float r = 3.0f * fmaxf(1.0f, d.scale); if (o.x * o.x + o.y * o.y > r * r) return; }   // nowhere near (most bodies)
     V3 dir{vel.x, vel.y, 0};
     float speed = Len(dir);
     if (speed < 0.01f) return;
@@ -965,6 +968,8 @@ void Update() {
     double dt = g_lastUpdate > 0 ? now - g_lastUpdate : 0;
     if (g_lastUpdate > 0 && dt < 0.002) return;            // other scenes of the same frame
     g_lastUpdate = now;
+    G::NewFrame();
+    Log_Flush();
     if (dt > 0.25) dt = 0.25;
     DevCommands();
     P::PollBlasts();
@@ -1045,19 +1050,18 @@ void Update() {
     // fixed 60 Hz steps
     g_acc += dt;
     int steps = 0;
-    while (g_acc >= 1.0 / 60 && steps < 4) {
+    while (g_acc >= 1.0 / 60 && steps < 2) {     // after a slow frame: no catching up (it would make the next slow too)
         for (auto& kv : g_dolls) Step(*kv.second, 1.0f / 60);
         Props_Step(1.0f / 60);
         g_acc -= 1.0 / 60; steps++;
     }
-    if (steps == 4) g_acc = 0;
+    if (steps == 2) g_acc = 0;
     Props_Update(area);
     Blood_Update(area);
 }
 
 void hk_SceneAnimate(void* scene, float dt) {
-    G::NewFrame();
-    Update();
+    Update();                                    // (once per frame; it starts the frame's memory-check cache)
     o_SceneAnimate(scene, dt);
 }
 
@@ -1092,8 +1096,21 @@ void hk_GobAnimate(void* gob, float dt) {
         if (it != g_byGob.end()) {
             Doll& d = *it->second;
             for (auto& r : d.parts) { F<V3>(r.part, 0x10) = r.lp; F<Q4>(r.part, 0x1c) = r.lq; }
-            std::vector<WT> w;
-            ComputeWorld(d, w, true);
+            V3 rp; Q4 rq;
+            if (d.done && d.pose.valid) P::GetWorld(d.parts[0].part, rp, rq);
+            if (d.done && d.pose.valid && Len(rp - d.pose.rp) < 1e-4f && fabsf(Dot4(rq, d.pose.rq)) > 0.999999f) {
+                // settled and not moved: the same locals as last frame
+                for (size_t i = 0; i < d.parts.size(); i++) { F<V3>(d.parts[i].part, 0x10) = d.pose.lp[i]; F<Q4>(d.parts[i].part, 0x1c) = d.pose.lq[i]; }
+            } else {
+                static std::vector<WT> w;
+                ComputeWorld(d, w, true);
+                if (d.done) {
+                    d.pose.valid = true;
+                    P::GetWorld(d.parts[0].part, d.pose.rp, d.pose.rq);
+                    d.pose.lp.resize(d.parts.size()); d.pose.lq.resize(d.parts.size());
+                    for (size_t i = 0; i < d.parts.size(); i++) { d.pose.lp[i] = F<V3>(d.parts[i].part, 0x10); d.pose.lq[i] = F<Q4>(d.parts[i].part, 0x1c); }
+                } else d.pose.valid = false;
+            }
         }
     }
     Cloth_AfterAnimate(gob);

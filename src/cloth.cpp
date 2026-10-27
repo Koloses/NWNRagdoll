@@ -207,9 +207,15 @@ void Cloth_AfterAnimate(void* gob) {
         V3 gp = F<V3>(gob, 0xa8);
         Vec3 pp = Pos(pl);
         if ((gp.x - pp.x) * (gp.x - pp.x) + (gp.y - pp.y) * (gp.y - pp.y) > C.range * C.range) return;
-        static std::map<void*, double> rejected;               // models without cloth bones: look again later
+        // models without cloth bones: not looked at again until the model is rebuilt (another root part)
+        static std::map<void*, void*> rejected;
+        void* root = F<void*>(gob, 0x90);
         auto rj = rejected.find(gob);
-        if (rj != rejected.end() && now - rj->second < 5.0) return;
+        if (rj != rejected.end() && rj->second == root) return;
+        // a few new models per frame (entering an area shows hundreds at once)
+        static double tryFrame = -1; static int tries = 0;
+        if (now != tryFrame) { tryFrame = now; tries = 0; }
+        if (++tries > 4) return;
         if ((int)g_cloth.size() >= C.maxActive) {
             // drop the one not seen for the longest
             auto old = g_cloth.begin();
@@ -218,7 +224,7 @@ void Cloth_AfterAnimate(void* gob) {
             g_cloth.erase(old);
         }
         Cloth c;
-        if (!Build(c, gob)) { rejected[gob] = now; if (rejected.size() > 2000) rejected.clear(); return; }
+        if (!Build(c, gob)) { if (rejected.size() > 20000) rejected.clear(); rejected[gob] = root; return; }
         it = g_cloth.emplace(gob, c).first;
     }
     Cloth& c = it->second;
