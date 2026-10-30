@@ -17,6 +17,7 @@
 #include "qmath.h"
 #include "log.h"
 #include "blood.h"
+#include "gore.h"
 #include <windows.h>
 #include <MinHook.h>
 #include <box3d/box3d.h>
@@ -72,7 +73,7 @@ bool ClientDead(void* cre) {
 // ---- model snapshot ----
 struct PartRec { void* part; int parent; V3 lp; Q4 lq; float s; int bone = -1; };
 enum JointKind { J_NONE, J_BALL, J_HINGE };
-enum : uint64_t { CAT_GROUND = 1, CAT_CORE = 2, CAT_ARM = 4, CAT_LEG = 8, CAT_DROP = 16, CAT_LIMB = 32 };
+enum : uint64_t { CAT_GROUND = 1, CAT_CORE = 2, CAT_ARM = 4, CAT_LEG = 8, CAT_DROP = 16, CAT_LIMB = 32, CAT_CUT = 64 };
 struct Bone {
     int part;                    // index into parts
     int parent = -1;             // parent bone
@@ -89,6 +90,7 @@ struct Bone {
     b3JointId jid = b3_nullJointId;
     V3 wp; Q4 wq;                // world transform (live while simulating, final afterwards)
     V3 v, w;                     // velocities to start with
+    bool cut = false;            // cut off (dismembered): no joint to the parent, placed on its own
 };
 struct Drop {                    // a weapon / shield that left the hand
     void* gob;                   // the attached Gob
@@ -117,6 +119,8 @@ struct Doll {
     struct Pose { bool valid = false; V3 rp; Q4 rq; std::vector<V3> lp; std::vector<Q4> lq; } pose;
     bool bled = false;
     float scale = 1;
+    int cut = -1;                // the bone cut off
+    double nextSpurt = 0; int spurts = 0;
 };
 std::map<uint32_t, Doll*> g_dolls;          // by creature id
 std::map<void*, Doll*> g_byGob;
@@ -158,11 +162,11 @@ void ComputeWorld(Doll& d, std::vector<WT>& w, bool useBones) {
             const Bone& b = d.bones[r.bone];
             Q4 lq = Norm(Conj(pw.q) * b.wq);
             F<Q4>(r.part, 0x1c) = lq;
-            if (b.root) {
+            if (b.root || b.cut) {
                 V3 lp = Rot(Conj(pw.q), b.wp - pw.p) * (1.0f / (pw.s > 1e-4f ? pw.s : 1.0f));
                 F<V3>(r.part, 0x10) = lp;
             }
-            w[i] = {b.root ? b.wp : pw.p + Rot(pw.q, F<V3>(r.part, 0x10) * pw.s), b.wq, pw.s * r.s};
+            w[i] = {b.root || b.cut ? b.wp : pw.p + Rot(pw.q, F<V3>(r.part, 0x10) * pw.s), b.wq, pw.s * r.s};
             continue;
         }
         w[i] = {pw.p + Rot(pw.q, F<V3>(r.part, 0x10) * pw.s), pw.q * F<Q4>(r.part, 0x1c), pw.s * r.s};
@@ -214,6 +218,7 @@ uint64_t MaskOf(uint64_t cat) {
     // limbs of a generic skeleton (beetles, spiders ...) start packed together: touching each other they push
     // apart hard enough to throw the body away, so they only meet the ground
     case CAT_LIMB: return CAT_GROUND;
+    case CAT_CUT: return CAT_GROUND;
     }
     return CAT_GROUND;
 }
@@ -280,8 +285,8 @@ void BuildWorld(Doll& d, void* area, bool springs) {
         bd.angularDamping = 1.0f;
         b.body = b3CreateBody(d.world, &bd);
         b3ShapeDef sd = b3DefaultShapeDef();
-        sd.filter.categoryBits = b.cat;
-        sd.filter.maskBits = MaskOf(b.cat);
+        sd.filter.categoryBits = b.cut ? CAT_CUT : b.cat;
+        sd.filter.maskBits = MaskOf(b.cut ? CAT_CUT : b.cat);
         sd.baseMaterial.friction = b.cat == CAT_LEG ? 0.5f : 0.8f;
         sd.baseMaterial.rollingResistance = 0.05f;
         sd.density = b.cat == CAT_LIMB ? 400.0f : 1000.0f;
@@ -289,7 +294,7 @@ void BuildWorld(Doll& d, void* area, bool springs) {
         else { b3Sphere sp{b3Vec3{0, 0, 0}, b.radius}; b3CreateSphereShape(b.body, &sd, &sp); }
     }
     for (auto& b : d.bones) {
-        if (b.parent < 0 || b.joint == J_NONE) continue;
+        if (b.parent < 0 || b.joint == J_NONE || b.cut) continue;
         Bone& pb = d.bones[b.parent];
         float hz = springs ? 2.5f * d.muscle * MuscleScale(b) : 0.0f;
         if (b.joint == J_HINGE) {
@@ -402,6 +407,21 @@ V3 AngVel(Q4 q0, Q4 q1, float dt) {
 }
 V3 ClampLen(V3 v, float m) { float l = Len(v); return l > m ? v * (m / l) : v; }
 
+// where the cut bone was joined to its parent: the wound on the body
+V3 Stump(const Doll& d) {
+    const Bone& b = d.bones[d.cut];
+    if (b.parent < 0) return b.wp;
+    const Bone& pb = d.bones[b.parent];
+    return pb.wp + Rot(pb.wq, P::VB(b.frameA.p));
+}
+// the wound keeps pulsing blood for a moment, smaller each time
+void Spurts(Doll& d) {
+    if (d.cut < 0 || d.spurts <= 0 || P::Now() < d.nextSpurt) return;
+    Gore_Spurt(Stump(d), d.spurts > 3 ? 1 : 0, d.blood);
+    d.spurts--;
+    d.nextSpurt = P::Now() + P::Rand(0.25f, 0.4f);
+}
+
 // prevW: world transforms of the part tree one animation frame before (Collect order), or null
 bool StartDoll(void* cre, void* gob, const std::vector<WT>* prevW, float prevDt) {
     Doll* dp = new Doll();
@@ -470,6 +490,12 @@ bool StartDoll(void* cre, void* gob, const std::vector<WT>* prevW, float prevDt)
                 if (defs[j].parentBone == (int)k && Len(w[defs[j].part].p - w[defs[k].part].p) > 0.05f * gs) { defs[k].tip = defs[j].part; break; }
     }
     if (defs.size() < 2) { delete dp; return false; }
+    // a blow that cuts a limb or the head off (humanoids)
+    int cutDef = -1;
+    if (humanoid) {
+        const char* cn = Gore_Cut(cre);
+        for (size_t k = 1; cn && k < defs.size(); k++) if (_stricmp(P::PartName(d.parts[defs[k].part].part), cn) == 0) cutDef = (int)k;
+    }
 
     // starting motion: the death animation's own motion, plus a push away from the killer (or a blast)
     V3 away = Rot(w[0].q, V3{0, -1, 0});               // models face +y: backwards
@@ -499,6 +525,12 @@ bool StartDoll(void* cre, void* gob, const std::vector<WT>* prevW, float prevDt)
             av = ClampLen(AngVel(pw.q, b.wq, prevDt), 12.0f);
         }
         if (blast) v = v + P::BlastVelocity(*blast, b.wp) * (0.7f + 0.3f * tip);
+        if ((int)k == cutDef) {
+            // the cut piece flies off: away from the killer, up, spinning
+            b.cut = true;
+            v = v + away * P::Rand(1.2f, 2.4f) + V3{P::Rand(-0.6f, 0.6f), P::Rand(-0.6f, 0.6f), P::Rand(1.8f, 3.2f)};
+            av = av + V3{P::Rand(-9, 9), P::Rand(-9, 9), P::Rand(-9, 9)};
+        }
         b.v = v; b.w = av;
         // shape
         V3 tipLocal;
@@ -575,6 +607,14 @@ bool StartDoll(void* cre, void* gob, const std::vector<WT>* prevW, float prevDt)
     for (size_t k = 0; k < d.bones.size(); k++) d.parts[d.bones[k].part].bone = (int)k;
     CollectDrops(d, away * C.push);
     BuildWorld(d, F<void*>(cre, OFS::Obj_Area), d.muscle > 0);
+    if (cutDef >= 0 && cutDef < (int)d.bones.size() && d.bones[cutDef].cut) {
+        d.cut = cutDef;
+        V3 wound = Stump(d);
+        Gore_Spurt(wound, 2, d.blood);
+        Gore_Chunks(wound, d.blood);
+        d.nextSpurt = P::Now() + 0.3; d.spurts = 6;
+        Log("ragdoll: %08x %s cut off", d.id, P::PartName(d.parts[d.bones[cutDef].part].part));
+    }
     if (C.debug > 1) for (size_t k = 0; k < d.bones.size(); k++) {
         const Bone& b = d.bones[k];
         Log("ragdoll:   bone %d %-24s parent %d at %.2f %.2f %.2f v %.2f %.2f %.2f w %.1f r %.3f len %.3f joint %d", (int)k, P::PartName(d.parts[b.part].part), b.parent,
@@ -671,6 +711,11 @@ void Bleed(Doll& d) {
         if (_stricmp(n, "head_g") == 0) head = b.wp;
     }
     Blood_Spill(torso, 0.55f * d.scale, P::Rand(6.0f, 9.0f), d.blood, floor);
+    if (d.cut >= 0) {
+        // more from the wound, and some where the cut piece lies
+        Blood_Spill(Stump(d), 0.35f * d.scale, P::Rand(4.0f, 6.0f), d.blood, floor);
+        Blood_Spill(d.bones[d.cut].wp, 0.22f * d.scale, P::Rand(2.0f, 3.0f), d.blood, floor);
+    }
     int drops = 1 + (int)P::Rand(0, 2.99f);
     for (int i = 0; i < drops; i++)
         Blood_Spill(head + V3{P::Rand(-0.4f, 0.4f), P::Rand(-0.4f, 0.4f), 0} * d.scale, P::Rand(0.08f, 0.15f) * d.scale, P::Rand(0.8f, 2.0f), d.blood, floor);
@@ -727,6 +772,12 @@ void Step(Doll& d, float dt) {
     }
 }
 
+// a rebuilt model's skeleton has no joints any more (a cut-off bone never had one)
+bool Jointed(const Doll& d) {
+    for (size_t k = 1; k < d.bones.size(); k++) if (d.bones[k].joint == J_NONE && !d.bones[k].cut) return false;
+    return true;
+}
+
 // a blast near a body: wake it (or add to its motion)
 void ApplyBlast(Doll& d, const P::Blast& bl, void* area) {
     if (d.lastBlast == bl.serial || d.bones.empty()) return;
@@ -735,9 +786,7 @@ void ApplyBlast(Doll& d, const P::Blast& bl, void* area) {
     if (dd.x * dd.x + dd.y * dd.y > bl.radius * bl.radius) return;
     d.lastBlast = bl.serial;
     if (d.done) {
-        bool joints = true;
-        for (size_t k = 1; k < d.bones.size(); k++) if (d.bones[k].joint == J_NONE) joints = false;
-        if (!joints) return;                      // model was rebuilt: the skeleton is not jointed any more
+        if (!Jointed(d)) return;                      // model was rebuilt: the skeleton is not jointed any more
         for (auto& b : d.bones) { b.v = P::BlastVelocity(bl, b.wp) * P::Rand(0.85f, 1.15f); b.w = V3{P::Rand(-2, 2), P::Rand(-2, 2), P::Rand(-2, 2)}; }
         for (auto& x : d.drops) { x.v = P::BlastVelocity(bl, x.wp) * 1.3f; x.w = V3{P::Rand(-8, 8), P::Rand(-8, 8), P::Rand(-8, 8)}; }
         d.muscle = 0;
@@ -750,10 +799,6 @@ void ApplyBlast(Doll& d, const P::Blast& bl, void* area) {
 }
 
 // something walking through a body: the parts near its feet are kicked along
-bool Jointed(const Doll& d) {
-    for (size_t k = 1; k < d.bones.size(); k++) if (d.bones[k].joint == J_NONE) return false;
-    return true;
-}
 void Kick(Doll& d, V3 from, V3 at, V3 vel, void* area) {
     double now = P::Now();
     if (d.bones.empty() || now - d.lastKick < 0.6) return;
@@ -946,6 +991,25 @@ void DevCommands() {
         if (ai && ev) ev(ai, 0, 0, id, id, F<uint32_t>((void*)A(0x140df9db4), 0), nullptr);
         return;
     }
+    if (strncmp(line, "attack ", 7) == 0) {   // attack <id> [<attacker>]: the hero (or attacker) attacks it (as ActionAttack)
+        char* e = nullptr;
+        uint32_t id = (uint32_t)strtoul(line + 7, &e, 16) & 0x7fffffffu;
+        uint32_t by = e ? (uint32_t)strtoul(e, nullptr, 16) : 0;
+        void* pl = Player();
+        void* sc = by ? P::ServerCreature(by) : pl ? P::ServerCreature(Id(pl)) : nullptr;
+        typedef int (*aa_t)(void*, uint32_t, int, int, int);
+        static aa_t fAA = (aa_t)GetProcAddress(GetModuleHandleA(nullptr), "?AddAttackActions@CNWSCreature@@QEAAHIHHH@Z");
+        Log("dev: attack %08x by %p", id, sc);
+        if (sc && fAA) fAA(sc, id, 0, 1, 0);
+        return;
+    }
+    if (strncmp(line, "goreany", 7) == 0) { Gore_AnyWeapon(true); Log("dev: every weapon cuts"); return; }
+    if (strncmp(line, "cut ", 4) == 0) {        // cut <id> <bone>: the next death of that creature cuts the bone off
+        char bone[32] = {};
+        uint32_t id = 0;
+        if (sscanf(line + 4, "%x %31s", &id, bone) == 2) { Gore_Force(id, bone); Log("dev: cut %08x %s", id, bone); }
+        return;
+    }
     if (strncmp(line, "kill ", 5) == 0) {
         uint32_t id = (uint32_t)strtoul(line + 5, nullptr, 16);
         void* sc = P::ServerCreature(id);
@@ -1038,6 +1102,7 @@ void Update() {
             for (auto pit = g_pending.begin(); pit != g_pending.end(); ++pit) if (pit->second.id == id) { g_pending.erase(pit); break; }
         }
     }
+    for (auto& kv : g_dolls) Spurts(*kv.second);
     // walking through bodies
     for (auto& m : movers)
         for (auto& kv : g_dolls) Kick(*kv.second, m.p0, m.p, m.v, area);
@@ -1181,6 +1246,7 @@ void Ragdoll_LoadConfig(const char* ini) {
     Props_LoadConfig(ini);
     Cloth_LoadConfig(ini);
     Blood_LoadConfig(ini);
+    Gore_LoadConfig(ini);
 }
 
 void Ragdoll_Install() {
@@ -1204,6 +1270,7 @@ void Ragdoll_Install() {
         Log("corpse hook ready");
     else { Log("corpse hook failed - corpses fade as usual"); C.keepCorpses = 0; }
     Blood_Install();
+    Gore_Install();
     P::InstallBlastHook();
     Props_Install();
     Cloth_Install();

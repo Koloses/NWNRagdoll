@@ -45,3 +45,17 @@
   server internal +0x100b0), CNWSCreature::UpdateActionQueue 0x1403a4550 (dev commands).
 * Humanoid cloth bones: Cloak_g > CL1_g..CL4_g, CM1_g..CM4_g, CR1_g..CR4_g (+ CL1_fg, CR1_fg,
   cloak_shL/R helpers); TF1_g > TF2_g > TF3_g01 (+ TF1L_g, TF1R_g); FB1_g01 > FB2_g01 > FB4_g01.
+
+## Gore (Win 8193.37)
+
+- `CNWCArea::ApplyFireAndForgetVisualEffect` 0x1407d8f60 (area, uint16 vfx, Vector*, holder*); holder =
+  {head, size} with head from 0x1403668b0(&holder) (a fresh map head, taken over by the call).
+- `CNWSCreature+0x880` CNWSCombatRound*; attack data at round+0, 50 x 0xf0 (`CNWSCombatAttackData`):
+  +4 target id, +0x16 damage shorts (-1 = none; [12] base physical), +0x56 weapon attack type,
+  +0x68 killing blow, +0x78 attack result (1 hit, 3 critical, 10 devastating). The round is reset
+  right after the attack, so the blow is read in a hook on `ResolvePostMeleeDamage` /
+  `ResolvePostRangedDamage` (killing blow already set there).
+- `CNWSItem+0x40` base item id; `g_pRules+0x20` CNWBaseItemArray; `CNWBaseItem+9` WeaponType
+  (1 piercing, 3 slashing, 4 piercing-slashing). Verified: light crossbow = 7, type 1.
+- visualeffects.2da: spurts 109-111 small, 112-114 large, 115-117 critical (red/green/yellow);
+  chunks 122/124/126.
