@@ -13,6 +13,11 @@ Physics for **Neverwinter Nights: Enhanced Edition** (Windows, build 8193.37):
 * **Blood.** A pool of blood spreads under bleeding bodies as they hit the ground, with a few
   drops around the head, and stays until you leave the area: red, green (zombies, ...) or yellow,
   by the creature's blood colour.
+* **Dismemberment.** A killing blow with a slashing weapon (swords, axes, claws ...) that is a
+  critical hit, or one that takes half the victim's hit points at once, can cut off the head, an arm or
+  a leg (humanoids, single player): the piece flies off spinning, the wound spurts with the game's own
+  combat blood and gore effects, and blood pools under both. The game's rules decide the blow; the mod
+  only shows it.
 * **Cloth.** Cloaks, tabards, belt flaps and loincloths swing with the body's motion, on everyone
   near you, alive or dead.
 * **Explosions** (fireball, meteor swarm, ice storm, gas / electric / mystical explosions, implosion
@@ -62,6 +67,11 @@ Copy `dbghelp.dll` and `NWNRagdoll.ini` into `Neverwinter Nights - Enhanced Edit
 | **[Blood]** Enabled | 1 | blood pools under the dead |
 | PoolSize | 1.0 | size of a full pool |
 | MaxPools | 48 | pools per area (the oldest are reused) |
+| **[Gore]** Dismemberment | 1 | slashing killing blows can cut off a head or limb |
+| CriticalChance | 1.0 | chance on a critical hit |
+| HeavyBlowChance | 0.5 | chance on a blow of half the victim's hit points or more |
+| Heads / Arms | 0.35 / 0.45 | share of heads and arms among cuts (the rest legs) |
+| Spurts | 1 | the wound spurts blood for a moment |
 | **[Physics]** Explosions | 1 | blasts throw bodies and items |
 | ItemsTumble | 1 | items landing on the ground tumble |
 | Debris | 1 | bashed placeables break into pieces (single player) |
@@ -81,7 +91,10 @@ death and set the bone rotations from the rigid bodies; cloth chains are simulat
 dropped, so the client keeps the body; it is cleared with the area). Blood pools are the game's
 `dag_floorblood1..6` models, scaled up over a few seconds. Death is read from the in-process server in
 single player (`CNWSObject::GetDead`) and from the client's damage level otherwise. The killer is the
-server's last damager (CNWSObject+0x198) in single player; online the closest creature of the other side. See
+server's last damager (CNWSObject+0x198) in single player; online the closest creature of the other side. Dismemberment notes each blow as the server
+resolves it (`CNWSCreature::ResolvePostMeleeDamage` / `ResolvePostRangedDamage`: the attack's result,
+damage and weapon from the combat round), frees the cut bone from its joint and plays the
+`visualeffects.2da` blood spurts / chunks at the wound (`CNWCArea::ApplyFireAndForgetVisualEffect`). See
 `docs/RE_NOTES.md`.
 
 ## Building
