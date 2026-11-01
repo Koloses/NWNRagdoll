@@ -21,7 +21,6 @@ struct Cfg {
     int debris = 1;
     float range = 30.0f;
     float debrisSeconds = 20.0f;
-    int debug = 0;
 } C;
 
 typedef void* (*NewAur_t)(const char* model, const char* tag, void* file);
@@ -140,7 +139,6 @@ Chunk* GetChunk(const char* model, void* scene) {
     Chunk c; c.gob = g;
     ModelBox(g, c.center, c.half);
     g_pool.push_back(c);
-    if (C.debug) Log("props: chunk %s box %.2f %.2f %.2f", model, c.half.x, c.half.y, c.half.z);
     (void)scene;
     return &g_pool.back();
 }
@@ -234,7 +232,6 @@ void Props_LoadConfig(const char* ini) {
     C.debris = GetPrivateProfileIntA("Physics", "Debris", 1, ini);
     char b[64]; GetPrivateProfileStringA("Physics", "DebrisSeconds", "20", b, sizeof b, ini);
     C.debrisSeconds = (float)atof(b);
-    C.debug = GetPrivateProfileIntA("Ragdoll", "Debug", 0, ini);
     Log("config: debris %d (%.0f s)", C.debris, C.debrisSeconds);
 }
 
@@ -276,54 +273,5 @@ void Props_Blast(const P::Blast& bl) {
         Body old = c.b;
         StartBody(c.b, g_area, old.wp, old.wq, v * 1.4f, V3{P::Rand(-12, 12), P::Rand(-12, 12), P::Rand(-12, 12)}, c.center, c.half, old.wp.z, 500.0f);
         c.born = P::Now();
-    }
-}
-
-void Props_DevCommand(const char* line) {
-    if (strncmp(line, "ext ", 4) == 0) {          // ext <object id>: mesh boxes of its model
-        void* o = GetObj((uint32_t)strtoul(line + 4, nullptr, 16));
-        void* g = o ? P::ObjectGob(o) : nullptr;
-        if (!g) return;
-        std::vector<void*> st{F<void*>(g, 0x90)};
-        while (!st.empty()) {
-            void* p = st.back(); st.pop_back();
-            if (!p || !Readable(p, 0x58)) continue;
-            void** ch = F<void**>(p, 0x38); int k = F<int>(p, 0x40);
-            for (int i = 0; ch && i < k && i < 64; i++) st.push_back(ch[i]);
-            void* m = F<void*>(p, 8);
-            V3 a = m ? F<V3>(m, 0xc0) : V3{}, b = m ? F<V3>(m, 0xcc) : V3{};
-            float r = m ? F<float>(m, 0xd8) : 0; V3 c = m ? F<V3>(m, 0xdc) : V3{};
-            Log("dev: part '%s' %s mdl %s  %.3f %.3f %.3f / %.3f %.3f %.3f  r %.3f c %.3f %.3f %.3f", P::PartName(p), ClassName(p), m ? ClassName(m) : "",
-                a.x, a.y, a.z, b.x, b.y, b.z, r, c.x, c.y, c.z);
-        }
-        return;
-    }
-    if (strncmp(line, "models", 6) == 0) {         // sizes of candidate debris models
-        const char* names[] = {"fx_chunklg", "fx_chunklg01", "fx_chunkm", "fx_chunksm", "fx_rockchunk", "fx_rockchunksml", "fx_rockchunkmed",
-                               "fx_shard01", "fx_shard02", "plc_chunk_w01", "plc_chunk_w02", "plc_chunk_s01", "plc_chunk_m01", "tbw_chunk01", "dag_chunk_g01", "m_chunk_r"};
-        for (const char* n : names) {
-            void* g = fNewAur ? fNewAur(n, "body", nullptr) : nullptr;
-            V3 a, b;
-            if (g) { P::SetGobTransform(g, V3{}, Q4{}); if (P::GobExtent(g, a, b)) Log("dev: %-16s %.2f %.2f %.2f .. %.2f %.2f %.2f", n, a.x, a.y, a.z, b.x, b.y, b.z); else Log("dev: %s no mesh", n); }
-            else Log("dev: %s not loaded", n);
-        }
-        return;
-    }
-    if (strncmp(line, "debris", 6) == 0) {         // debris: a crate's worth of pieces next to the player
-        void* pl = Player();
-        if (!pl) return;
-        Vec3 p = Pos(pl);
-        Vec3 o = F<Vec3>(pl, OFS::Obj_Orient);
-        Placeable rec; rec.model = "plc_crate";
-        V3 c{p.x + o.x * 1.5f, p.y + o.y * 1.5f, p.z};
-        rec.p = c; rec.mn = c + V3{-0.35f, -0.35f, 0}; rec.mx = c + V3{0.35f, 0.35f, 0.7f};
-        Shatter(rec, g_area);
-        return;
-    }
-    if (strncmp(line, "shatter ", 8) == 0) {      // shatter <placeable id>: break it as if destroyed
-        uint32_t id = (uint32_t)strtoul(line + 8, nullptr, 16);
-        auto it = g_placeables.find(id);
-        if (it == g_placeables.end()) { Log("dev: placeable %08x not tracked", id); return; }
-        Shatter(it->second, g_area);
     }
 }

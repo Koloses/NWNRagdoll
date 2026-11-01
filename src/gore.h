@@ -14,7 +14,3 @@ const char* Gore_Cut(void* creature);
 // 2 critical; a burst of flesh (chunks)
 void Gore_Spurt(V3 p, int size, char blood);
 void Gore_Chunks(V3 p, char blood);
-// dev: the next death of this creature cuts this bone
-void Gore_Force(uint32_t id, const char* bone);
-// dev: every weapon counts as slashing (testing with whatever the hero holds)
-void Gore_AnyWeapon(bool on);
