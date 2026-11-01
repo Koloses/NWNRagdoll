@@ -157,8 +157,9 @@ bool GroundAt(void* area, float x, float y, float& h) {
     void* td = F<void*>(tile, 0x40);
     void* mesh = td ? F<void*>(td, 8) : nullptr;
     if (!mesh) return false;
+    // the tile's walkmesh is in its own 10 m square, unrotated: area position -> tile position -> canonical
     float cx, cy;
-    fToCanonical(tile, x, y, &cx, &cy);
+    fToCanonical(tile, x - floorf(x / 10.0f) * 10.0f, y - floorf(y / 10.0f) * 10.0f, &cx, &cy);
     if (fFindTri(mesh, 0, 0, cx, cy, -1) < 0) return false;
     V3 c{cx, cy, 0};
     h = fMeshHeight(mesh, &c) + F<float>(tile, 0x10);
