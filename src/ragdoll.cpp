@@ -48,8 +48,6 @@ struct Cfg {
     float kickSpeed = 2.0f;      // m/s added at the foot
     int keepCorpses = 1;         // dead creatures stay instead of fading away
     int maxCorpses = 60;         // kept per area; the oldest fade when there are more
-    int debug = 0;
-    char devFile[260] = "";      // testing commands
 } C;
 
 typedef void (*Animate_t)(void* gob, float dt);
@@ -241,7 +239,7 @@ bool KillerPos(void* cre, V3& out) {
         uint32_t dmg = so ? F<uint32_t>(so, 0x198) : 0x7f000000;
         if (dmg != 0x7f000000 && dmg != (Id(cre) & 0x7fffffffu)) {
             void* o = P::ServerObject(dmg);
-            if (o) { out = F<V3>(o, 0xa4); if (C.debug) Log("ragdoll: killer %08x", dmg); return true; }
+            if (o) { out = F<V3>(o, 0xa4); return true; }
         }
     }
     void* pl = Player();
@@ -376,8 +374,6 @@ void CollectDrops(Doll& d, V3 push) {
         x.half = V3{fmaxf(x.half.x, 0.02f), fmaxf(x.half.y, 0.02f), fmaxf(x.half.z, 0.02f)};
         x.v = push * 0.7f + V3{P::Rand(-0.6f, 0.6f), P::Rand(-0.6f, 0.6f), P::Rand(0.8f, 1.6f)};
         x.w = V3{P::Rand(-4, 4), P::Rand(-4, 4), P::Rand(-4, 4)};
-        if (C.debug) Log("ragdoll: drop '%s' from %s, box %.2f %.2f %.2f at %.2f %.2f %.2f", P::PartName(F<void*>(c, 0x90)), pn,
-                         x.half.x, x.half.y, x.half.z, x.center.x, x.center.y, x.center.z);
         d.drops.push_back(x);
     }
 }
@@ -615,11 +611,6 @@ bool StartDoll(void* cre, void* gob, const std::vector<WT>* prevW, float prevDt)
         d.nextSpurt = P::Now() + 0.3; d.spurts = 6;
         Log("ragdoll: %08x %s cut off", d.id, P::PartName(d.parts[d.bones[cutDef].part].part));
     }
-    if (C.debug > 1) for (size_t k = 0; k < d.bones.size(); k++) {
-        const Bone& b = d.bones[k];
-        Log("ragdoll:   bone %d %-24s parent %d at %.2f %.2f %.2f v %.2f %.2f %.2f w %.1f r %.3f len %.3f joint %d", (int)k, P::PartName(d.parts[b.part].part), b.parent,
-            b.wp.x, b.wp.y, b.wp.z, b.v.x, b.v.y, b.v.z, Len(b.w), b.radius, b.capsule ? Len(b.b - b.a) : 0.0f, (int)b.joint);
-    }
     g_dolls[d.id] = dp;
     g_byGob[gob] = dp;
     for (auto& x : dp->drops) g_dropByGob[x.gob] = &x;
@@ -764,11 +755,6 @@ void Step(Doll& d, float dt) {
     d.calm = maxV < 0.08f ? d.calm + dt : 0;
     if ((d.t > 0.8 && d.calm > 0.5) || d.t > C.settleTime) {
         Settle(d);
-        if (C.debug) {
-            Log("ragdoll: %08x settled after %.1f s (ground %.2f, corpse at %.2f %.2f)", d.id, d.t, d.ground, d.anchor.x, d.anchor.y);
-            for (auto& b : d.bones) Log("ragdoll:   %-12s %.2f %.2f %.2f", P::PartName(d.parts[b.part].part), b.wp.x, b.wp.y, b.wp.z);
-            for (auto& x : d.drops) Log("ragdoll:   drop at %.2f %.2f %.2f", x.wp.x, x.wp.y, x.wp.z);
-        }
     }
 }
 
@@ -822,7 +808,6 @@ void Kick(Doll& d, V3 from, V3 at, V3 vel, void* area) {
         if (dd < best) { best = dd; }
     }
     float r = 0.4f;
-    if (C.debug > 1 && best < 4.0f) Log("ragdoll: %08x walker at %.2f m (%.1f m/s)", d.id, sqrtf(best), speed);
     if (best > r * r) return;
     if (d.done && !Jointed(d)) return;                        // model was rebuilt: no skeleton to move
     d.lastKick = now;
@@ -843,7 +828,6 @@ void Kick(Doll& d, V3 from, V3 at, V3 vel, void* area) {
         for (auto& b : d.bones) b3Body_SetLinearVelocity(b.body, BV(VB(b3Body_GetLinearVelocity(b.body)) + push(b.wp, 1.1f * d.scale)));
         for (auto& x : d.drops) b3Body_SetLinearVelocity(x.body, BV(VB(b3Body_GetLinearVelocity(x.body)) + push(x.wp, 0.8f) * 1.2f));
     }
-    if (C.debug) Log("ragdoll: %08x kicked at %.1f m/s", d.id, speed);
 }
 
 // ---- corpses stay: the server's "delete this creature" is not carried out for the dead ----
@@ -854,13 +838,12 @@ std::vector<uint32_t> g_kept;               // kept corpses of this area, oldest
 bool KeepCorpse(uint32_t id) {
     void* o = GetObj(id);
     void* pl = Player();
-    if (!o || !pl || Type(o) != OT_CREATURE || o == pl) { if (C.debug) Log("ragdoll: %08x obj %p", id, o); return false; }
-    if (F<void*>(o, OFS::Obj_Area) != PlayerArea()) { if (C.debug) Log("ragdoll: %08x not in this area", id); return false; }
+    if (!o || !pl || Type(o) != OT_CREATURE || o == pl) return false;
+    if (F<void*>(o, OFS::Obj_Area) != PlayerArea()) return false;
     auto it = g_dead.find(id);
     bool dead = it != g_dead.end() ? it->second : ClientDead(o);
-    if (!dead) { if (C.debug) Log("ragdoll: %08x not dead", id); return false; }
+    if (!dead) return false;
     if (P::ServerApp() && P::ServerCreature(id)) {                     // still there: only out of sight
-        if (C.debug) Log("ragdoll: %08x still on the server", id);
         return false;
     }
     return true;
@@ -883,7 +866,6 @@ int hk_CreatureDelete(void* msg) {
         const char* buf = F<const char*>(msg, 0x38);
         if (buf && (uint64_t)pos + 4 <= size) {
             uint32_t id = *(const uint32_t*)(buf + pos);
-            if (C.debug) Log("ragdoll: server deletes %08x", id);
             if (KeepCorpse(id)) {
                 F<uint32_t>(msg, 0x44) = pos + 4;        // ReadOBJECTIDClient
                 fReadBool(msg);                          // instant or faded
@@ -904,128 +886,6 @@ int hk_CreatureDelete(void* msg) {
     return o_CreatureDelete(msg);
 }
 
-struct DevWalk { V3 a, b; double t0 = 0, secs = 0; } g_walk;
-void DevWalkStep() {
-    if (g_walk.secs <= 0) return;
-    void* pl = Player();
-    if (!pl) { g_walk.secs = 0; return; }
-    float u = (float)((P::Now() - g_walk.t0) / g_walk.secs);
-    if (u > 1) { u = 1; g_walk.secs = 0; }
-    V3 p = g_walk.a + (g_walk.b - g_walk.a) * u;
-    P::SetServerPosition(Id(pl), p);
-    F<Vec3>(pl, OFS::Obj_Pos) = Vec3{p.x, p.y, p.z};
-}
-
-void DevCommands() {
-    DevWalkStep();
-    if (!C.devFile[0]) return;
-    FILE* f = fopen(C.devFile, "r");
-    if (!f) return;
-    char line[128] = {};
-    if (!fgets(line, sizeof line, f)) line[0] = 0;
-    fclose(f);
-    DeleteFileA(C.devFile);
-    if (strncmp(line, "cam ", 4) == 0) {      // cam <zoom> <pitch> <yaw>
-        float z = 0, p = 0, y = 0;
-        void* in = Internal();
-        if (in && sscanf(line + 4, "%f %f %f", &z, &p, &y) == 3) {
-            Log("dev: cam was %.2f %.2f %.2f", F<float>(in, OFS::In_CamZoom), F<float>(in, OFS::In_CamPitch), F<float>(in, OFS::In_CamYaw));
-            F<float>(in, OFS::In_CamZoom) += z; F<float>(in, OFS::In_CamPitch) += p; F<float>(in, OFS::In_CamYaw) += y;
-        }
-        return;
-    }
-    if (strncmp(line, "walk ", 5) == 0) {     // walk <x0> <y0> <x1> <y1> <seconds>: move the player in a straight line
-        float s = 1;
-        if (sscanf(line + 5, "%f %f %f %f %f", &g_walk.a.x, &g_walk.a.y, &g_walk.b.x, &g_walk.b.y, &s) == 5) {
-            void* pl = Player();
-            g_walk.a.z = g_walk.b.z = pl ? Pos(pl).z : 0;
-            g_walk.t0 = P::Now(); g_walk.secs = s;
-            Log("dev: walk %.1f %.1f -> %.1f %.1f in %.1f s", g_walk.a.x, g_walk.a.y, g_walk.b.x, g_walk.b.y, s);
-        }
-        return;
-    }
-    if (strncmp(line, "objs", 4) == 0) {
-        void* area = PlayerArea();
-        int n = area ? F<int>(area, OFS::Area_ObjCount) : 0;
-        uint32_t* ids = area ? F<uint32_t*>(area, OFS::Area_ObjIds) : nullptr;
-        for (int i = 0; ids && i < n; i++) {
-            void* o = GetObj(ids[i]);
-            if (!o) { Log("dev: %08x (no object)", ids[i]); continue; }
-            Vec3 p = Pos(o);
-            Log("dev: %08x type %d %s at %.1f %.1f %.1f gob %p", ids[i], Type(o), ClassName(o), p.x, p.y, p.z, P::ObjectGob(o));
-        }
-        return;
-    }
-    if (strncmp(line, "blast ", 6) == 0) {    // blast <x> <y> <z>: a fireball-sized push
-        V3 p;
-        if (sscanf(line + 6, "%f %f %f", &p.x, &p.y, &p.z) == 3) {
-            P::Blast b{p, 6.5f, 5.0f, false, P::Now(), 0x80000000u + (uint32_t)GetTickCount()};
-            for (auto& kv : g_dolls) ApplyBlast(*kv.second, b, PlayerArea());
-            Props_Blast(b);
-            Log("dev: blast at %.1f %.1f %.1f", p.x, p.y, p.z);
-        }
-        return;
-    }
-    if (strncmp(line, "hostile ", 8) == 0) {  // put a creature in the hostile faction (single player)
-        uint32_t id = (uint32_t)strtoul(line + 8, nullptr, 16);
-        void* srv = P::ServerApp();
-        void* in = srv ? F<void*>(srv, 8) : nullptr;
-        void* mgr = in ? F<void*>(in, 0x100b0) : nullptr;
-        typedef void* (*gf_t)(void*, int);
-        typedef void (*am_t)(void*, uint32_t, int);
-        void* fac = mgr ? ((gf_t)A(0x140355c80))(mgr, 1) : nullptr;
-        Log("dev: hostile %08x mgr %p faction %p", id, mgr, fac);
-        if (fac) ((am_t)A(0x1404ab900))(fac, id & 0x7fffffffu, 1);
-        return;
-    }
-    if (strncmp(line, "destroy ", 8) == 0) {  // destroy <id>: the server removes the object (as DestroyObject)
-        uint32_t id = (uint32_t)strtoul(line + 8, nullptr, 16) & 0x7fffffffu;
-        HMODULE exe = GetModuleHandleA(nullptr);
-        typedef void* (*gm_t)(void*);
-        typedef int (*ev_t)(void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
-        gm_t gm = (gm_t)GetProcAddress(exe, "?GetServerAIMaster@CServerExoApp@@QEAAPEAVCServerAIMaster@@XZ");
-        ev_t ev = (ev_t)GetProcAddress(exe, "?AddEventDeltaTime@CServerAIMaster@@QEAAHIIIIIPEAX@Z");
-        void* srv = P::ServerApp();
-        void* ai = srv && gm ? gm(srv) : nullptr;
-        Log("dev: destroy %08x", id);
-        if (ai && ev) ev(ai, 0, 0, id, id, F<uint32_t>((void*)A(0x140df9db4), 0), nullptr);
-        return;
-    }
-    if (strncmp(line, "attack ", 7) == 0) {   // attack <id> [<attacker>]: the hero (or attacker) attacks it (as ActionAttack)
-        char* e = nullptr;
-        uint32_t id = (uint32_t)strtoul(line + 7, &e, 16) & 0x7fffffffu;
-        uint32_t by = e ? (uint32_t)strtoul(e, nullptr, 16) : 0;
-        void* pl = Player();
-        void* sc = by ? P::ServerCreature(by) : pl ? P::ServerCreature(Id(pl)) : nullptr;
-        typedef int (*aa_t)(void*, uint32_t, int, int, int);
-        static aa_t fAA = (aa_t)GetProcAddress(GetModuleHandleA(nullptr), "?AddAttackActions@CNWSCreature@@QEAAHIHHH@Z");
-        Log("dev: attack %08x by %p", id, sc);
-        if (sc && fAA) fAA(sc, id, 0, 1, 0);
-        return;
-    }
-    if (strncmp(line, "goreany", 7) == 0) { Gore_AnyWeapon(true); Log("dev: every weapon cuts"); return; }
-    if (strncmp(line, "cut ", 4) == 0) {        // cut <id> <bone>: the next death of that creature cuts the bone off
-        char bone[32] = {};
-        uint32_t id = 0;
-        if (sscanf(line + 4, "%x %31s", &id, bone) == 2) { Gore_Force(id, bone); Log("dev: cut %08x %s", id, bone); }
-        return;
-    }
-    if (strncmp(line, "kill ", 5) == 0) {
-        uint32_t id = (uint32_t)strtoul(line + 5, nullptr, 16);
-        void* sc = P::ServerCreature(id);
-        typedef void (*dmg_t)(void*, int);
-        static dmg_t fDmg = (dmg_t)GetProcAddress(GetModuleHandleA(nullptr), "?DoDamage@CNWSCreature@@UEAAXH@Z");
-        Log("dev: kill %08x -> %p", id, sc);
-        if (sc) { void* so = VCall<void* (*)(void*)>(sc, 0x20)(sc); if (so) F<uint32_t>(so, 0x198) = 0x7fffffff; }
-        if (sc && fDmg) fDmg(sc, 1000);
-        // what the death effect does: the "dead" activity starts the death animation
-        typedef void (*uaq_t)(void*);
-        if (sc) ((uaq_t)A(0x1403a4550))(sc);         // CNWSCreature::UpdateActionQueue
-        return;
-    }
-    Props_DevCommand(line);
-}
-
 // once per rendered frame, before the scene animates: watch deaths, step the simulations
 void Update() {
     double now = P::Now();
@@ -1035,7 +895,6 @@ void Update() {
     G::NewFrame();
     Log_Flush();
     if (dt > 0.25) dt = 0.25;
-    DevCommands();
     P::PollBlasts();
     void* pl = Player();
     void* area = PlayerArea();
@@ -1125,34 +984,15 @@ void Update() {
     Blood_Update(area);
 }
 
-// time spent in our code per frame: frames over 8 ms and long gaps are logged
-double g_tUpdate = 0, g_tGob = 0;
-double Ms() { LARGE_INTEGER f, t; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t); return t.QuadPart * 1000.0 / f.QuadPart; }
-void ProfFrame() {
-    static double last = 0;
-    double now = Ms();
-    static int n = 0;
-    if (last > 0 && now - last > 400.0 && n < 300) { n++; Log("prof: FREEZE %.0f ms between frames (ragdoll in it: update %.1f, models %.1f ms, %d dolls)", now - last, g_tUpdate, g_tGob, (int)g_dolls.size()); }
-    else if (g_tUpdate + g_tGob > 8.0 && n < 300) { n++; Log("prof: frame spent %.1f ms in NWNRagdoll (update %.1f, models %.1f, %d dolls)", g_tUpdate + g_tGob, g_tUpdate, g_tGob, (int)g_dolls.size()); }
-    last = now;
-    g_tUpdate = g_tGob = 0;
-}
-
 void hk_SceneAnimate(void* scene, float dt) {
-    double t0 = Ms();
-    double gap = P::Now() - g_lastUpdate;
-    if (gap >= 0.002) ProfFrame();               // a new frame (the same check Update makes)
     Update();                                    // (once per frame; it starts the frame's memory-check cache)
-    g_tUpdate += Ms() - t0;
     o_SceneAnimate(scene, dt);
 }
 
 static void GobAfter(void* gob);
 void hk_GobAnimate(void* gob, float dt) {
     o_GobAnimate(gob, dt);
-    double t0 = Ms();
     GobAfter(gob);
-    g_tGob += Ms() - t0;
 }
 static void GobAfter(void* gob) {
     auto pit = g_pending.find(gob);
@@ -1162,7 +1002,7 @@ static void GobAfter(void* gob) {
         double now = P::Now();
         // the server says dead a moment before the death animation starts: wait until the body moves,
         // let the animation carry it for the lead time, then take over with its momentum
-        bool go = now - pd.t0 > (C.debug > 1 ? 4.0 : 1.6) || (pd.moveT > 0 && now - pd.moveT >= C.animLead);
+        bool go = now - pd.t0 > 1.6 || (pd.moveT > 0 && now - pd.moveT >= C.animLead);
         if (go && !pd.prev.empty()) {
             void* c = GetObj(pd.id);
             std::vector<WT> prev = pd.prev; float pdt = (float)(now - pd.lastT);
@@ -1175,8 +1015,7 @@ static void GobAfter(void* gob) {
             else if (pd.moveT <= 0 && pd.first.size() == pd.prev.size()) {
                 float sum = 0;
                 for (size_t i = 0; i < pd.prev.size(); i++) sum += Len(pd.prev[i].p - pd.first[i].p);
-                if (C.debug > 1) Log("ragdoll: %08x pending %.2f s, moved %.3f", pd.id, now - pd.t0, sum / pd.prev.size());
-                if (sum / pd.prev.size() > 0.05f * P::GobScale(gob)) { pd.moveT = now; if (C.debug) Log("ragdoll: %08x death animation moving after %.2f s", pd.id, now - pd.t0); }
+                if (sum / pd.prev.size() > 0.05f * P::GobScale(gob)) pd.moveT = now;
             }
         }
     } else {
@@ -1239,8 +1078,6 @@ void Ragdoll_LoadConfig(const char* ini) {
     C.kickSpeed = IniFloat("Ragdoll", "KickStrength", 2.0f, ini);
     C.keepCorpses = IniInt("Ragdoll", "KeepCorpses", 1, ini);
     C.maxCorpses = IniInt("Ragdoll", "MaxCorpses", 60, ini);
-    C.debug = IniInt("Ragdoll", "Debug", 0, ini);
-    GetPrivateProfileStringA("Developer", "CommandFile", "", C.devFile, sizeof C.devFile, ini);
     Log("config: enabled %d moveCorpse %d pin %.2f push %.2f lead %.2f muscle %.2f maxTime %.1f maxActive %d range %.0f drop %d blasts %d",
         C.enabled, C.reposition, C.pinRadius, C.push, C.animLead, C.muscle, C.settleTime, C.maxActive, C.range, C.dropWeapons, C.explosions);
     Log("config: kick %d (%.1f) keep corpses %d (max %d)", C.kick, C.kickSpeed, C.keepCorpses, C.maxCorpses);

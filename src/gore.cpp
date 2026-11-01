@@ -27,7 +27,6 @@ struct Cfg {
     float headShare = 0.35f;     // of cuts: the head
     float armShare = 0.45f;      //          an arm (the rest: a leg)
     int spurts = 1;              // the wound pulses blood for a moment
-    int debug = 0;
 } C;
 
 // CNWCArea::ApplyFireAndForgetVisualEffect(area, vfx, Vector*, holder*) - the holder is a fresh map head
@@ -42,7 +41,6 @@ typedef void* (*GetBaseItem_t)(void* arr, int id);
 GetBaseItem_t fBaseItem = nullptr;
 void** pRules = nullptr;
 
-std::map<uint32_t, std::string> g_force;
 
 int VfxId(int kind, char blood) {
     // kind: 0 small, 1 large, 2 critical spurt, 3 chunks
@@ -71,9 +69,6 @@ void Gore_Chunks(V3 p, char blood) {
     if (!C.enabled || blood == 'N' || blood == 'W') return;
     Fire(VfxId(3, blood), p);
 }
-void Gore_Force(uint32_t id, const char* bone) { g_force[id] = bone; }
-static bool g_anyWeapon = false;
-void Gore_AnyWeapon(bool on) { g_anyWeapon = on; }
 
 namespace {
 
@@ -123,28 +118,20 @@ void hk_PostRanged(void* a, void* t) { o_PostRanged(a, t); Record(a, t); }
 const char* Gore_Cut(void* cre) {
     if (!C.enabled || !cre) return nullptr;
     uint32_t id = Id(cre);
-    auto f = g_force.find(id);
-    if (f != g_force.end()) {
-        static std::string forced;
-        forced = f->second; g_force.erase(f);
-        return forced.c_str();
-    }
     Blow b{};
     bool have = false;
     EnterCriticalSection(&g_cs);
     auto it = g_blows.find(id & 0x7fffffffu);
     if (it != g_blows.end()) { b = it->second; have = true; g_blows.erase(it); }
     LeaveCriticalSection(&g_cs);
-    if (!have || P::Now() - b.t > 6.0) { if (C.debug) Log("gore: %08x no blow known", id); return nullptr; }
+    if (!have || P::Now() - b.t > 6.0) return nullptr;
     bool crit = b.result == 3 || b.result == 10;                         // AttackResult: critical, devastating
     void* st = F<void*>(cre, OFS::Cre_Stats);
     int maxHp = st ? F<short>(st, OFS::Stats_MaxHP) : 0;
-    bool slashing = b.wtype == 3 || b.wtype == 4 || g_anyWeapon;                        // baseitems WeaponType slashing, piercing-slashing
+    bool slashing = b.wtype == 3 || b.wtype == 4;                        // baseitems WeaponType slashing, piercing-slashing
     bool heavy = maxHp > 0 && b.dmg * 2 >= maxHp;
     float chance = !slashing ? 0.0f : crit ? C.critChance : heavy ? C.heavyChance : 0.0f;
     float roll = P::Rand(0, 1);
-    if (C.debug) Log("gore: %08x killed by %08x: result %d damage %d (max hp %d) weapon %d type %d -> chance %.2f roll %.2f",
-                     id, b.attacker, b.result, b.dmg, maxHp, b.baseItem, b.wtype, chance, roll);
     if (roll >= chance) return nullptr;
     float r = P::Rand(0, 1);
     bool left = P::Rand(0, 1) < 0.5f;
@@ -161,7 +148,6 @@ void Gore_LoadConfig(const char* ini) {
     C.headShare = f("Heads", 0.35f);
     C.armShare = f("Arms", 0.45f);
     C.spurts = GetPrivateProfileIntA("Gore", "Spurts", 1, ini);
-    C.debug = GetPrivateProfileIntA("Ragdoll", "Debug", 0, ini);
     Log("gore: dismemberment %d (critical %.2f, heavy %.2f; heads %.2f arms %.2f) spurts %d", C.enabled, C.critChance, C.heavyChance,
         C.headShare, C.armShare, C.spurts);
 }
