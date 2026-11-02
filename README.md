@@ -1,6 +1,6 @@
 # NWNRagdoll
 
-Physics for **Neverwinter Nights: Enhanced Edition** (Windows, build 8193.37):
+Physics for **Neverwinter Nights: Enhanced Edition** (Windows, build 8193.37-17):
 
 * **Ragdolls.** When a creature dies, its death animation starts and then real physics takes over
   with the animation's own motion: the body is knocked over away from whoever dealt the killing blow,

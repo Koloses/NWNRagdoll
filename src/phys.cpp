@@ -24,7 +24,7 @@ SetPos_t fSrvSetPosition = nullptr;
 void** p_AppManager = nullptr;
 
 typedef void* (*GetTile_t)(void* area, const V3* pos);
-GetTile_t fGetTile = nullptr;               // CNWCArea::GetTile(Vector) 0x1407d9d00
+GetTile_t fGetTile = nullptr;               // CNWCArea::GetTile(Vector) 0x1407db200
 typedef void (*Rot_t)(void* tile, float x, float y, float* ox, float* oy);
 Rot_t fToCanonical = nullptr;
 typedef int (*FindTri_t)(void* mesh, int type, int start, float x, float y, int skip);
@@ -53,7 +53,7 @@ bool Init() {
     fToCanonical = (Rot_t)GetProcAddress(exe, "?RotateRealToCanonicalTile@CNWTile@@QEAAXMMPEAM0@Z");
     fFindTri = (FindTri_t)GetProcAddress(exe, "?FindTriangle@CNWTileSurfaceMesh@@QEAAHHHMMH@Z");
     fMeshHeight = (Height_t)GetProcAddress(exe, "?ComputeHeight@CNWTileSurfaceMesh@@QEAAMVVector@@@Z");
-    fGetTile = (GetTile_t)A(0x1407d9d00);            // not exported (CNWCArea::GetTile)
+    fGetTile = (GetTile_t)A(0x1407db200);            // not exported (CNWCArea::GetTile)
     fGetWorld = (GetWorld_t)GetProcAddress(exe, "?GetWorld@Part@@UEAAXAEAVVector@@AEAVQuaternion@@@Z");
     fSrvCreature = (GetCreature_t)GetProcAddress(exe, "?GetCreatureByGameObjectID@CServerExoApp@@QEAAPEAVCNWSCreature@@I@Z");
     fSrvObject = (GetGameObject_t)GetProcAddress(exe, "?GetGameObject@CServerExoApp@@QEAAPEAVCGameObject@@I@Z");
@@ -273,7 +273,7 @@ uint64_t hk_LoadEffect(void* vfx, int id) {
 }  // namespace
 
 void InstallBlastHook() {
-    void* p = (void*)A(0x1408711d0);                  // CNWCVisualEffect::LoadEffect(unsigned int)
+    void* p = (void*)A(0x140872770);                  // CNWCVisualEffect::LoadEffect(unsigned int)
     if (MH_CreateHook(p, (void*)hk_LoadEffect, (void**)&o_LoadEffect) == MH_OK && MH_EnableHook(p) == MH_OK) Log("blast hook ready");
     else Log("blast hook failed");
 }

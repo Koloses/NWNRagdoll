@@ -852,9 +852,9 @@ bool KeepCorpse(uint32_t id) {
 // what the delete message does, for a kept corpse that has to go after all
 void FadeAway(void* o) {
     typedef void (*i_t)(void*, int); typedef void (*c_t)(void*, char); typedef void (*d_t)(void*, char, int, uint32_t);
-    ((i_t)A(0x140764260))(o, 0);                         // CNWCObject::SetCutsceneInvisible
-    ((c_t)A(0x140764780))(o, 1);                         // SetFadeState
-    ((d_t)A(0x140764420))(o, 0, 1, 3000);                // SetDesiredFadeState
+    ((i_t)A(0x140765760))(o, 0);                         // CNWCObject::SetCutsceneInvisible
+    ((c_t)A(0x140765c80))(o, 1);                         // SetFadeState
+    ((d_t)A(0x140765920))(o, 0, 1, 3000);                // SetDesiredFadeState
     VCall<void (*)(void*)>(o, 0x188)(o);
     F<int>(o, 0x26c) = 0;
     F<int>(o, 0x104) = 1;                                // deleted once faded
@@ -1102,7 +1102,7 @@ void Ragdoll_Install() {
     else { Log("attach hook failed - weapons stay in the hands"); C.dropWeapons = 0; }
     fReadBool = (Msg_t)GetProcAddress(exe, "?ReadBOOL@CNWMessage@@QEAAHXZ");
     fReadOverflow = (Msg_t)GetProcAddress(exe, "?MessageReadOverflow@CNWMessage@@QEAAHXZ");
-    void* cd = (void*)A(0x140780210);                    // CNWCMessage::HandleServerToPlayerCreatureUpdate_Delete
+    void* cd = (void*)A(0x140781710);                    // CNWCMessage::HandleServerToPlayerCreatureUpdate_Delete
     if (fReadBool && fReadOverflow && MH_CreateHook(cd, (void*)hk_CreatureDelete, (void**)&o_CreatureDelete) == MH_OK && MH_EnableHook(cd) == MH_OK)
         Log("corpse hook ready");
     else { Log("corpse hook failed - corpses fade as usual"); C.keepCorpses = 0; }

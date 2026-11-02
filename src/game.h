@@ -1,4 +1,4 @@
-// NWNPad - game interface for NWN:EE 8193.37 (Win64, nwmain.exe)
+// NWNRagdoll - game interface for NWN:EE 8193.37-17 (Win64, nwmain.exe)
 #pragma once
 #include <cstdint>
 #include <cstddef>
@@ -15,31 +15,31 @@ template <class T> inline T VCall(void* obj, size_t off) { return (T)((*(void***
 // ---- addresses (VA in the 0x140000000-based image) ----
 namespace VA {
 constexpr uintptr_t g_pAppManager            = 0;   // resolved from export
-constexpr uintptr_t ProcessInput             = 0x1406eeb50;
-constexpr uintptr_t HandleInputEvent         = 0x1406eada0;
-constexpr uintptr_t UpdateDriveMode          = 0x1406ef4b0;
-constexpr uintptr_t UpdateCamera             = 0x1406e38a0;
-constexpr uintptr_t UpdateMouseCursorAppearance = 0x1406efea0;
-constexpr uintptr_t Internal_GetPlayerCreature = 0x1406d6140;
-constexpr uintptr_t Internal_GetModule       = 0x1406d5970;
-constexpr uintptr_t App_GetGameObject        = 0x1406a91d0;
-constexpr uintptr_t App_GetPlayerCreature    = 0x1406a9810;
-constexpr uintptr_t PerformDefaultActionOnObject = 0x1406ed540;
-constexpr uintptr_t FeedbackHitCheckHostile  = 0x1406e84a0;
-constexpr uintptr_t FeedbackHitCheckNonHostile = 0x1406e9370;
-constexpr uintptr_t PerformLButtonDownAction = 0x1406ed940;
-constexpr uintptr_t PerformRButtonDownAction = 0x1406ee750;
-constexpr uintptr_t GuiMan_GuiObjectHitCheck = 0x1401f31f0;
-constexpr uintptr_t GuiMan_HandleKeyEvent    = 0x1401f3630;
-constexpr uintptr_t GuiMan_SetMousePosition  = 0x1401f4c30;
+constexpr uintptr_t ProcessInput             = 0x1406f14e0;
+constexpr uintptr_t HandleInputEvent         = 0x1406ed720;
+constexpr uintptr_t UpdateDriveMode          = 0x1406f1e40;
+constexpr uintptr_t UpdateCamera             = 0x1406e6220;
+constexpr uintptr_t UpdateMouseCursorAppearance = 0x1406f2830;
+constexpr uintptr_t Internal_GetPlayerCreature = 0x1406d8ad0;
+constexpr uintptr_t Internal_GetModule       = 0x1406d8300;
+constexpr uintptr_t App_GetGameObject        = 0x1406abb60;
+constexpr uintptr_t App_GetPlayerCreature    = 0x1406ac1a0;
+constexpr uintptr_t PerformDefaultActionOnObject = 0x1406efec0;
+constexpr uintptr_t FeedbackHitCheckHostile  = 0x1406eae20;
+constexpr uintptr_t FeedbackHitCheckNonHostile = 0x1406ebcf0;
+constexpr uintptr_t PerformLButtonDownAction = 0x1406f02c0;
+constexpr uintptr_t PerformRButtonDownAction = 0x1406f10e0;
+constexpr uintptr_t GuiMan_GuiObjectHitCheck = 0x1401f4e30;
+constexpr uintptr_t GuiMan_HandleKeyEvent    = 0x1401f5270;
+constexpr uintptr_t GuiMan_SetMousePosition  = 0x1401f6870;
 constexpr uintptr_t Camera_GetYaw            = 0x140059020;
 constexpr uintptr_t Camera_MapToScreen       = 0x140059a90;
-constexpr uintptr_t QuickBar_ClickButton     = 0x14085ae10;
-constexpr uintptr_t QuickBar_ActivateButtonSet = 0x1408584c0;
-constexpr uintptr_t GuiInGame_ShowDialogEntry   = 0x1406f8bd0;
-constexpr uintptr_t GuiInGame_ShowDialogReplies = 0x1406f8f50;
-constexpr uintptr_t GuiInGame_HandleDialogSelection = 0x1406f5850;
-constexpr uintptr_t ActionTarget_HandleLMouseDown = 0x14083a860;
+constexpr uintptr_t QuickBar_ClickButton     = 0x14085c3b0;
+constexpr uintptr_t QuickBar_ActivateButtonSet = 0x140859a60;
+constexpr uintptr_t GuiInGame_ShowDialogEntry   = 0x1406fb560;
+constexpr uintptr_t GuiInGame_ShowDialogReplies = 0x1406fb8e0;
+constexpr uintptr_t GuiInGame_HandleDialogSelection = 0x1406f81e0;
+constexpr uintptr_t ActionTarget_HandleLMouseDown = 0x14083be00;
 }
 
 // ---- offsets ----

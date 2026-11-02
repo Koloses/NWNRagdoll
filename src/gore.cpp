@@ -30,7 +30,7 @@ struct Cfg {
 } C;
 
 // CNWCArea::ApplyFireAndForgetVisualEffect(area, vfx, Vector*, holder*) - the holder is a fresh map head
-// the function takes over (what its callers build with 0x1403668b0)
+// the function takes over (what its callers build with 0x140368530)
 typedef int (*ApplyFF_t)(void* area, uint16_t vfx, const V3* pos, void* holder);
 typedef void* (*MakeHead_t)(void* holder);
 ApplyFF_t fApplyFF = nullptr;
@@ -154,8 +154,8 @@ void Gore_LoadConfig(const char* ini) {
 
 void Gore_Install() {
     HMODULE exe = GetModuleHandleA(nullptr);
-    fApplyFF = (ApplyFF_t)A(0x1407d8f60);
-    fMakeHead = (MakeHead_t)A(0x1403668b0);
+    fApplyFF = (ApplyFF_t)A(0x1407da460);
+    fMakeHead = (MakeHead_t)A(0x140368530);
     fAttackWeapon = (GetWeapon_t)GetProcAddress(exe, "?GetCurrentAttackWeapon@CNWSCombatRound@@QEAAPEAVCNWSItem@@H@Z");
     fBaseItem = (GetBaseItem_t)GetProcAddress(exe, "?GetBaseItem@CNWBaseItemArray@@QEBAPEAVCNWBaseItem@@H@Z");
     pRules = (void**)GetProcAddress(exe, "?g_pRules@@3PEAVCNWRules@@EA");

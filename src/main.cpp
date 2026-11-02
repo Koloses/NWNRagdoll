@@ -1,4 +1,4 @@
-// NWNRagdoll - client-side ragdoll physics for dying creatures in NWN:EE (Win64 8193.37)
+// NWNRagdoll - client-side ragdoll physics for dying creatures in NWN:EE (Win64 8193.37-17)
 #include <windows.h>
 #include <cstdio>
 #include <MinHook.h>
@@ -12,7 +12,7 @@ static char g_dir[MAX_PATH];
 static bool SupportedBuild() {
     auto* d = (IMAGE_DOS_HEADER*)GetModuleHandleA(nullptr);
     auto* nt = (IMAGE_NT_HEADERS64*)((char*)d + d->e_lfanew);
-    return nt->FileHeader.TimeDateStamp == 0x6782a73f && nt->OptionalHeader.SizeOfImage == 0x1711000;
+    return nt->FileHeader.TimeDateStamp == 0x68e408bc && nt->OptionalHeader.SizeOfImage == 0x1716000;
 }
 
 static void Init() {
